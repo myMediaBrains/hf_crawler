@@ -11,3 +11,5 @@ Requests==2.34.2
 sqlmodel==0.0.39
 uvicorn==0.52.1
 googlenewsdecoder>=0.1.7
+trafilatura>=1.12.0
+curl_cffi>=0.7.0

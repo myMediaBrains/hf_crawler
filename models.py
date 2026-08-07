@@ -37,6 +37,7 @@ class SourceOrigin(str, Enum):
     MANUAL = "manual"                 # 초기 고정 RSS 목록 (기존 TARGET_SOURCES)
     AUTO_PROMOTED = "auto_promoted"   # 같은 키워드에서 같은 출처가 3회 이상 등장 -> 자동 승격
     MANUAL_ADDED = "manual_added"     # 사용자가 직접 찾아서 즉시 등록
+    BLOCKED = "blocked"               # 크롤링이 막혀 기사를 한 건도 저장 못한 도메인 (블록리스트)
 
 
 class SourceStatus(str, Enum):
@@ -156,7 +157,11 @@ class Translation(SQLModel, table=True):
     translated_content: str
 
     origin: ContentOrigin = Field(default=ContentOrigin.LLM_TRANSLATED)
-    model_used: Optional[str] = None   # 예: "qwen3.5:9b" (model_router의 TIER_MODELS 값과 맞춤)
+    model_used: Optional[str] = None
+    block_reason: Optional[str] = None
+    # 블록리스트(category="블록리스트")에만 채워지는 사유 키워드.
+    # 예: "타임아웃" / "동의배너차단" / "본문추출실패" / "차단(원인불명)"
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -174,11 +179,8 @@ class Source(SQLModel, table=True):
     name: str
     url: str = Field(unique=True, index=True)
     category: Optional[str] = None
-    # 기존 name의 "[AI]", "[골프]" 같은 접두어에 대응. 통계/필터링용.
 
     source_type: str = Field(default="rss", index=True)
-    # Collector 레지스트리 조회 키. 지금 구현: "rss" | "google_news_search".
-    # 향후 추가 예: "youtube_channel", "podcast_rss", "image_gallery" 등.
 
     origin: SourceOrigin = Field(default=SourceOrigin.MANUAL)
     status: SourceStatus = Field(default=SourceStatus.ACTIVE)
@@ -189,10 +191,9 @@ class Source(SQLModel, table=True):
     last_attempt_at: Optional[datetime] = None
 
     keyword_id: Optional[int] = Field(default=None, foreign_key="keywords.id")
-    # 이 소스가 auto_promoted라면, 어떤 키워드 검색에서 유래했는지 참조.
-    # manual/manual_added 소스는 None.
 
     model_used: Optional[str] = None
+    block_reason: Optional[str] = None   # ← 이 줄이 있는지 확인
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -233,6 +234,20 @@ class CandidateSource(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class BlockedDomain(SQLModel, table=True):
+    """
+    사용자가 출처관리에서 '블록리스트' 소스를 삭제하면 여기에 도메인이 기록된다.
+    이후 수집(collect_for_keyword/collect)에서 이 도메인이 RSS 결과에 다시 나와도
+    크롤링을 시도하지 않고 즉시 건너뛴다 - "삭제 = 앞으로도 검색 안 함"을 보장하기 위함.
+    """
+    __tablename__ = "blocked_domains"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    domain: str = Field(unique=True, index=True)
+    reason: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ============================================================

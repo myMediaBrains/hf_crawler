@@ -218,13 +218,27 @@ function App() {
     
     // 리듀서 상태
     const [articleStates, dispatch] = useReducer(articleReducer, initialState);
+
+    // articleStates.editing이 바뀔 때마다 editingIdsRef를 최신 상태로 유지한다.
+    useEffect(() => {
+        editingIdsRef.current = new Set(
+            Object.entries(articleStates.editing)
+                .filter(([, isEditing]) => isEditing)
+                .map(([id]) => Number(id))
+        );
+    }, [articleStates.editing]);
     
     // EventSource 참조 관리
     const eventSourceRef = useRef({});
-
-    // 정제/번역/편집 버튼을 누른 문서를 목록 최상단에 고정해두기 위한 참조.
-    // fetchArticles()가 다시 호출돼도(정제/저장 후 등) 이 id를 기준으로 재정렬한다.
+    
+    // EventSource 참조 관리
     const pinnedArticleIdRef = useRef(null);
+
+    // 지금 편집 중인 기사 id 집합 - fetchArticles()가 다른 키워드 필터로 목록을
+    // 새로 받아와도, 편집 중인 기사가 그 필터에 안 걸려 화면에서 사라지는 일이
+    // 없도록 하기 위한 참조. 아래 useEffect가 articleStates.editing이 바뀔 때마다
+    // 최신값으로 동기화한다.
+    const editingIdsRef = useRef(new Set());
 
     const moveIdToTop = (list, id) => {
         if (!id) return list;
@@ -253,7 +267,19 @@ function App() {
             
             const response = await axios.get(url);
             const fetched = response.data.articles || [];
-            setArticles(moveIdToTop(fetched, pinnedArticleIdRef.current));
+
+            setArticles((prev) => {
+                const fetchedIds = new Set(fetched.map((a) => a.id));
+                // 지금 편집 중인 기사가 이번 검색 필터에 안 걸려 새 목록에서
+                // 빠지더라도, 저장하지 않은 편집 내용을 잃지 않도록 이전 목록에서
+                // 그대로 가져와 뒤에 붙여둔다 - 실시간 수집이 끝나 목록이 갱신돼도
+                // 편집 작업이 화면에서 사라지지 않게 하기 위함.
+                const editingButMissing = prev.filter(
+                    (a) => editingIdsRef.current.has(a.id) && !fetchedIds.has(a.id)
+                );
+                const merged = editingButMissing.length > 0 ? [...fetched, ...editingButMissing] : fetched;
+                return moveIdToTop(merged, pinnedArticleIdRef.current);
+            });
         } catch (err) {
             console.error("아티클 조회 에러:", err);
             toast.error('아티클을 불러오는데 실패했습니다.');
@@ -1410,20 +1436,32 @@ function App() {
                                                             </a>
                                                         </td>
                                                         <td className="source-table-interval">
-                                                            <input
-                                                                type="number"
-                                                                min="0.5"
-                                                                step="0.5"
-                                                                defaultValue={src.interval_hours}
-                                                                style={{ width: '50px' }}
-                                                                title={`다음 점검: ${formatNextCheck(src.last_attempt_at, src.interval_hours)}`}
-                                                                onBlur={(e) => {
-                                                                    const v = Number(e.target.value);
-                                                                    if (v > 0 && v !== src.interval_hours) {
-                                                                        handleUpdateSourceInterval(src.id, v);
-                                                                    }
-                                                                }}
-                                                            />
+                                                            {src.category === 'BlockList' ? (
+                                                                <span
+                                                                    className="source-table-block-reason"
+                                                                    title="크롤링이 계속 막혀 기사를 저장하지 못한 사유"
+                                                                >
+                                                                    🚫 {src.block_reason || '차단(원인불명)'}
+                                                                </span>
+                                                            ) : (
+                                                                <>
+                                                                    <input
+                                                                        type="number"
+                                                                        min="0.5"
+                                                                        step="0.5"
+                                                                        defaultValue={src.interval_hours}
+                                                                        style={{ width: '50px', textAlign: 'right' }}
+                                                                        title={`다음 점검: ${formatNextCheck(src.last_attempt_at, src.interval_hours)}`}
+                                                                        onBlur={(e) => {
+                                                                            const v = Number(e.target.value);
+                                                                            if (v > 0 && v !== src.interval_hours) {
+                                                                                handleUpdateSourceInterval(src.id, v);
+                                                                            }
+                                                                        }}
+                                                                    />
+                                                                    <span style={{ marginLeft: '4px' }}>시간</span>
+                                                                </>
+                                                            )}
                                                         </td>
                                                         <td className="source-table-delete-cell">
                                                             {confirmDeleteId === src.id ? (

@@ -24,8 +24,8 @@ import requests
 import feedparser
 from sqlmodel import Session, select
 
-from models import Article, Source, Keyword, ContentOrigin
-from content_utils import clean_article_content, crawl_url_sync, is_crawl_failure
+from models import Article, Source, Keyword, ContentOrigin, SourceOrigin, SourceStatus, BlockedDomain
+from content_utils import clean_article_content, crawl_url_sync, is_crawl_failure, classify_block_reason
 from personalization import classify_and_store
 
 logger = logging.getLogger(__name__)
@@ -162,6 +162,10 @@ class GoogleNewsSearchCollector(BaseCollector):
 
         feed = feedparser.parse(response.content)
 
+        # 사용자가 출처관리에서 삭제해 blocked_domains에 등록한 도메인들 - 이번 수집
+        # 전체에서 한 번만 조회해두고, 아래 루프에서 나올 때마다 즉시 건너뛴다.
+        blocked_domains = {b.domain for b in session.exec(select(BlockedDomain)).all()}
+
         for entry in feed.entries[:20]:
             if job_control.is_cancelled():
                 logger.info("[GoogleNewsSearchCollector] 사용자 요청으로 수집 중단")
@@ -175,6 +179,9 @@ class GoogleNewsSearchCollector(BaseCollector):
                 continue
 
             domain, extracted_name = self._extract_source(entry, title)
+            if domain in blocked_domains:
+                continue  # 사용자가 삭제로 영구 제외한 도메인 - 크롤링 시도조차 안 함
+
             if fixed_source_name:
                 source_name = fixed_source_name
             elif keyword_name:
@@ -185,9 +192,6 @@ class GoogleNewsSearchCollector(BaseCollector):
                 source_name = f"[{keyword_name}] {extracted_name}"
             else:
                 source_name = extracted_name
-
-            if track_domains:
-                discovered.append((domain, extracted_name))
                 
             # Google 뉴스 RSS의 link는 news.google.com/rss/articles/... 리다이렉트
             # 래퍼 URL이라, 이 상태로 그대로 크롤링하면 실제 기사 대신 구글 자체
@@ -202,6 +206,7 @@ class GoogleNewsSearchCollector(BaseCollector):
             raw_content = crawl_url_sync(resolved_link)
             if is_crawl_failure(raw_content):
                 logger.warning(f"[GoogleNewsSearchCollector] 크롤링 실패/본문 추출 불가로 건너뜀: {resolved_link}")
+                self._record_blocked_source(session, domain, extracted_name, keyword_name, raw_content)
                 continue
 
             cleaned = clean_article_content(raw_content)
@@ -227,9 +232,13 @@ class GoogleNewsSearchCollector(BaseCollector):
             )
             new_count += 1
 
+            if track_domains:
+                discovered.append((domain, extracted_name))
+
         session.commit()
         return CollectResult(new_count=new_count, discovered_domains=discovered)
 
+    
     @staticmethod
     def _resolve_real_url(google_news_link: str) -> str:
         """
@@ -287,6 +296,46 @@ class GoogleNewsSearchCollector(BaseCollector):
                 return name.lower().replace(" ", ""), name
 
         return "unknown", "Unknown"
+
+    @staticmethod
+    def _record_blocked_source(
+        session: Session,
+        domain: str,
+        extracted_name: str,
+        keyword_name: str | None,
+        raw_content: str,
+    ):
+        """
+        크롤링이 막혀 기사를 저장하지 못한 도메인을 '블록리스트' 카테고리의
+        Source 행으로 기록한다. 실제 재수집 대상 URL이 아니라 기록용이므로
+        url은 도메인 기반 고유값(blocked://도메인)을 쓴다.
+        """
+        if domain == "unknown":
+            return
+
+        reason = classify_block_reason(raw_content)
+        block_url = f"https://{domain}"
+        display_name = f"[{keyword_name}] {extracted_name}" if keyword_name else extracted_name
+
+        existing = session.exec(select(Source).where(Source.url == block_url)).first()
+        if existing:
+            existing.block_reason = reason
+            existing.fail_count += 1
+            existing.last_attempt_at = datetime.now()
+            session.add(existing)
+        else:
+            session.add(Source(
+                name=display_name,
+                url=block_url,
+                category="BlockList",
+                source_type="blocked",
+                origin=SourceOrigin.BLOCKED,
+                status=SourceStatus.FAILING,
+                fail_count=1,
+                block_reason=reason,
+                last_attempt_at=datetime.now(),
+            ))
+        session.commit()
 
 
 COLLECTOR_REGISTRY: dict[str, BaseCollector] = {

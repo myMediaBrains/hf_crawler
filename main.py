@@ -23,6 +23,7 @@ from content_utils import (
 from collectors import COLLECTOR_REGISTRY
 from datetime import datetime
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 from typing import AsyncGenerator
 from dotenv import load_dotenv
 
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 from database import engine, get_session, create_db_and_tables
 from models import (
     Article, Translation, Keyword, Source, CandidateSource, SchedulerConfig,
-    SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin,
+    SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin, BlockedDomain,
 )
 
 # 개인화 레이어 import (신규)
@@ -204,6 +205,7 @@ scheduler = BackgroundScheduler()
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     migrate_db.migrate(DB_NAME)
+    migrate_db.migrate_sources(DB_NAME)
     logger.info("📊 데이터베이스 테이블이 준비되었습니다.")
 
     scheduler_module.seed_manual_sources(TARGET_SOURCES)
@@ -1030,6 +1032,7 @@ def list_sources(session: Session = Depends(get_session)):
                 "fail_count": s.fail_count,
                 "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
                 "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
+                "block_reason": s.block_reason,
             }
             for s in sources
         ]
@@ -1082,10 +1085,24 @@ def delete_source(source_id: int, session: Session = Depends(get_session)):
     if not source:
         raise HTTPException(status_code=404, detail="해당 소스를 찾을 수 없습니다.")
 
+    name = source.name
+    message = f"'{name}' 소스가 삭제되었습니다."
+
+    # 블록리스트 항목을 삭제하면, 그 도메인을 blocked_domains에 영구 기록해서
+    # 앞으로의 수집(키워드 검색 등)에서 다시는 검색/크롤링 시도조차 하지 않게 한다.
+    if source.source_type == "blocked":
+        domain = urlparse(source.url).netloc
+        already_blocked = session.exec(
+            select(BlockedDomain).where(BlockedDomain.domain == domain)
+        ).first()
+        if not already_blocked:
+            session.add(BlockedDomain(domain=domain, reason=source.block_reason))
+        message = f"'{name}' 소스가 삭제되었고, 앞으로 '{domain}' 도메인은 검색에서 제외됩니다."
+
     session.delete(source)
     session.commit()
 
-    return {"status": "success", "message": f"'{source.name}' 소스가 삭제되었습니다."}
+    return {"status": "success", "message": message}
 
 
 # 3-6. 스케줄러 틱 간격 조회

@@ -24,6 +24,9 @@ import logging
 import threading
 from urllib.parse import urlparse
 
+import trafilatura
+from curl_cffi import requests as curl_requests
+
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.content_filter_strategy import PruningContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
@@ -314,6 +317,68 @@ def is_crawl_failure(text: str) -> bool:
     return any(marker in stripped for marker in _CRAWL_FAILURE_MARKERS)
 
 
+_FALLBACK_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+
+def _try_trafilatura_fallback(url: str) -> str | None:
+    """
+    crawl4ai(헤드리스 브라우저)가 실패로 판정됐을 때 마지막으로 시도하는 폴백.
+
+    일반 requests 라이브러리는 TLS Handshake 지문(JA3)이 매우 특징적이라
+    Cloudflare/PerimeterX/Akamai 같은 방화벽이 브라우저 JS 실행 여부를 보기도
+    전에 즉시 차단한다. curl_cffi(impersonate="chrome124")는 실제 Chrome의
+    TLS/HTTP2 지문을 그대로 재현해서 이 1차 차단선을 통과한다.
+    (그래도 강한 상용 안티봇에 CAPTCHA/JS 챌린지까지 걸린 사이트는 못 뚫는다 -
+    그런 사이트는 계속 is_crawl_failure()로 걸러지는 게 정상.)
+    """
+    try:
+        resp = curl_requests.get(
+            url,
+            headers=_FALLBACK_HEADERS,
+            impersonate="chrome124",
+            timeout=10,
+        )
+        if resp.status_code != 200 or not resp.text:
+            return None
+
+        extracted = trafilatura.extract(
+            resp.text,
+            output_format="markdown",
+            include_formatting=True,
+            include_tables=True,
+            include_images=False,
+            favor_recall=True,
+        )
+        return extracted
+    except Exception as e:
+        logger.warning(f"[Trafilatura 폴백] 실패: {url} ({e})")
+        return None
+
+
+def classify_block_reason(raw_content: str) -> str:
+    """
+    is_crawl_failure()가 True를 반환한 텍스트를 보고, 출처관리 '블록리스트'에
+    사람이 한눈에 훑어볼 수 있는 짧은 한글 키워드 사유로 변환한다.
+    """
+    if not raw_content:
+        return "본문없음"
+    text = raw_content.strip()
+    if "타임아웃" in text:
+        return "타임아웃"
+    if "동의 배너" in text or "쿠키" in text:
+        return "동의배너차단"
+    if "크롤링 중 에러" in text:
+        return "크롤링에러"
+    if "본문 추출 실패" in text or "유효한 본문" in text:
+        return "본문추출실패"
+    if len(text) < 30:
+        return "본문없음"
+    return "차단(원인불명)"
+
+
 async def _crawl_single_target_async(target_url: str) -> str:
     """
     단일 URL 크롤링 비동기 헬퍼.
@@ -337,6 +402,9 @@ async def _crawl_single_target_async(target_url: str) -> str:
                 excluded_tags=["nav", "footer", "header", "aside", "form"],
                 exclude_external_links=True,
                 word_count_threshold=10,
+                magic=True,               # 쿠키/동의 배너, 팝업 오버레이 자동 처리
+                simulate_user=True,       # 사람처럼 마우스 이동/스크롤을 흉내내 봇 탐지 회피
+                override_navigator=True,  # 헤드리스 브라우저임을 드러내는 navigator 지문 숨김
             )
 
             async with AsyncWebCrawler(verbose=False) as crawler:
@@ -358,7 +426,7 @@ async def _crawl_single_target_async(target_url: str) -> str:
             logger.error(f"크롤링 타임아웃(20초): {target_url}")
             return "크롤링 타임아웃"
         except Exception as e:
-            logger.error(f"크롤링 에러 ({target_url}): {str(e)}")
+            logger.error(f"크롤링 에러 ({target_url}): {type(e).__name__}: {e}", exc_info=True)
             return f"크롤링 중 에러 발생: {str(e)}"
 
 
@@ -370,11 +438,10 @@ async def _crawl_single_target_async(target_url: str) -> str:
 # 결과를 기다렸다가 반환하는 방식이라, 풀을 재사용해서 얻는 이득이 거의 없었다).
 
 
-def crawl_url_sync(url: str, timeout: int = 30) -> str:
+def _crawl_via_crawl4ai_sync(url: str, timeout: int = 30) -> str:
     """
-    동기 컨텍스트(APScheduler job, 동기 API 엔드포인트)에서 크롤링을 실행하는 헬퍼.
-    지정 시간 내 안 끝나면 그 URL은 포기하고 즉시 반환한다 (전체 파이프라인이
-    하나의 느린 URL 때문에 통째로 멈추는 걸 방지).
+    crawl4ai(헤드리스 브라우저) 경로. 지정 시간 내 안 끝나면 그 URL은 포기하고
+    즉시 반환한다 (전체 파이프라인이 하나의 느린 URL 때문에 통째로 멈추는 걸 방지).
     """
     result_holder: dict = {}
 
@@ -398,3 +465,27 @@ def crawl_url_sync(url: str, timeout: int = 30) -> str:
         return f"크롤링 중 에러 발생: {result_holder['error']}"
 
     return result_holder.get("value", "크롤링 타임아웃")
+
+
+def crawl_url_sync(url: str, timeout: int = 30) -> str:
+    """
+    동기 컨텍스트(APScheduler job, 동기 API 엔드포인트)에서 크롤링을 실행하는 헬퍼.
+
+    1차: crawl4ai(헤드리스 브라우저) - JS 렌더링이 필요한 페이지에 강함.
+    2차(폴백): 1차가 실패로 판정되면 Trafilatura(순수 HTTP GET)로 한 번 더 시도한다.
+    둘 다 실패하면 1차 결과(플레이스홀더 텍스트)를 그대로 반환해 is_crawl_failure()가
+    걸러내게 한다.
+    """
+    primary = _crawl_via_crawl4ai_sync(url, timeout=timeout)
+    if not is_crawl_failure(primary):
+        return primary
+
+    fallback = _try_trafilatura_fallback(url)
+    if fallback and not is_crawl_failure(fallback):
+        logger.info(f"[crawl_url_sync] crawl4ai 실패 -> Trafilatura 폴백 성공: {url}")
+        return fallback
+
+    # nodriver(3차, Cloudflare 챌린지 우회 시도)는 Python 3.14와 라이브러리
+    # 내부 호환 문제로 매번 예외만 내며 실패해서 제거함 (2026-08-08).
+    # Python 버전을 낮추면 재도입을 검토할 수 있음 - 그 전까지는 1·2차까지만 사용.
+    return primary

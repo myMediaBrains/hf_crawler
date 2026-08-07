@@ -52,3 +52,34 @@ def migrate(db_path: str):
         logger.info("[migrate_db] articles 테이블 - 추가할 컬럼 없음 (이미 최신 상태)")
 
     conn.close()
+
+SOURCES_MIGRATIONS = [
+    ("block_reason", "ALTER TABLE sources ADD COLUMN block_reason TEXT"),
+]
+
+
+def migrate_sources(db_path: str):
+    """sources 테이블에 block_reason 컬럼(블록리스트 사유)을 추가한다. 멱등성 보장."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("PRAGMA table_info(sources)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+    except sqlite3.OperationalError:
+        conn.close()
+        return
+
+    added = []
+    for column_name, sql in SOURCES_MIGRATIONS:
+        if column_name not in existing_columns:
+            cursor.execute(sql)
+            added.append(column_name)
+
+    if added:
+        conn.commit()
+        logger.info(f"[migrate_db] sources 테이블에 컬럼 추가: {added}")
+    else:
+        logger.info("[migrate_db] sources 테이블 - 추가할 컬럼 없음 (이미 최신 상태)")
+
+    conn.close()

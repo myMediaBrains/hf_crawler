@@ -1891,3 +1891,10 @@ body {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.3; }
 }
+
+.source-table-block-reason {
+    color: #f87171;
+    font-size: 0.78rem;
+    font-weight: 600;
+    white-space: nowrap;
+}
