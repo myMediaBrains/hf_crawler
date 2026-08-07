@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+
+# 비밀값
+.env
+
+# 프론트엔드
+hf-frontend/node_modules/
+hf-frontend/dist/
+
+# OS
+.DS_Store*.db.backup
