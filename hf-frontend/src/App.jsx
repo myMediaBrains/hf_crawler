@@ -67,6 +67,83 @@ function articleReducer(state, action) {
     }
 }
 
+// 소스 출처(origin)가 자동 승격인지 판별 - models.py의 SourceOrigin
+// (MANUAL/AUTO_PROMOTED/MANUAL_ADDED) 값이 그대로 내려오므로 문자열에
+// "auto"가 포함되는지로 판별한다 (대소문자 무관하게 안전히 처리).
+function isAutoOrigin(origin) {
+    return typeof origin === 'string' && origin.toLowerCase().includes('auto');
+}
+
+// 정치/경제 카테고리는 personalization 레이어에서 "민감 카테고리"로 다루므로
+// (프로필을 결론 유도가 아니라 필터링에만 쓰는 원칙), 소스 관리 화면에서도
+// 같은 기준으로 살짝 표시해준다. 카테고리 문자열 목록만 여기서 관리하면 되고,
+// 새 민감 카테고리가 생기면 이 배열에 추가하기만 하면 된다.
+const SENSITIVE_CATEGORIES = ['Politics', 'Economy'];
+
+function isSensitiveCategory(category) {
+    return SENSITIVE_CATEGORIES.includes(category);
+}
+
+// 소스 목록을 카테고리별로 묶는다. 카테고리가 비어있으면 "미분류"로 모으고
+// 항상 맨 뒤에 배치한다. 카테고리 이름/소스 이름 모두 가나다(알파벳)순 정렬.
+function groupSourcesByCategory(list) {
+    const buckets = {};
+    list.forEach((src) => {
+        const cat = src.category && src.category.trim() ? src.category : '미분류';
+        if (!buckets[cat]) buckets[cat] = [];
+        buckets[cat].push(src);
+    });
+
+    const categoryNames = Object.keys(buckets).sort((a, b) => {
+        if (a === '미분류') return 1;
+        if (b === '미분류') return -1;
+        return a.localeCompare(b);
+    });
+
+    return categoryNames.map((category) => ({
+        category,
+        sources: buckets[category].sort((a, b) => a.name.localeCompare(b.name)),
+    }));
+}
+
+// fail_count가 3 이상이면 "탈락 후보"로 취급 (SourceStatus.FAILING 판정 기준과 동일)
+function isFailingCandidate(src) {
+    return (src.fail_count || 0) >= 3;
+}
+
+// 카테고리 필터 / 탈락 후보 필터를 적용한 목록을 반환한다.
+// 두 필터는 상호 배타적으로 쓰인다 (동시에 켜면 어느 한쪽이 무시된 것처럼
+// 보여 혼란스러우므로, 호출부에서 토글 시 반대쪽을 항상 꺼준다).
+function applySourceFilters(list, categoryFilter, showFailingOnly) {
+    if (showFailingOnly) {
+        return list.filter(isFailingCandidate);
+    }
+    if (categoryFilter) {
+        return list.filter((src) => {
+            const cat = src.category && src.category.trim() ? src.category : '미분류';
+            return cat === categoryFilter;
+        });
+    }
+    return list;
+}
+
+// 필터 칩에 표시할 "카테고리별 개수"는 항상 전체 목록 기준으로 계산한다
+// (필터를 걸어도 다른 카테고리 버튼의 숫자가 사라지면 안 되기 때문).
+function getCategoryCounts(list) {
+    const counts = {};
+    list.forEach((src) => {
+        const cat = src.category && src.category.trim() ? src.category : '미분류';
+        counts[cat] = (counts[cat] || 0) + 1;
+    });
+    const names = Object.keys(counts).sort((a, b) => {
+        if (a === '미분류') return 1;
+        if (b === '미분류') return -1;
+        return a.localeCompare(b);
+    });
+    return names.map((category) => ({ category, count: counts[category] }));
+}
+
+
 // ============================================
 // 메인 App 컴포넌트
 // ============================================
@@ -83,13 +160,15 @@ function App() {
     const [loading, setLoading] = useState(false);
     const [message, setMessage] = useState('');
     const [keywordStats, setKeywordStats] = useState({});
-    const [showSourceStats, setShowSourceStats] = useState(false);
-    const [sourceStatsData, setSourceStatsData] = useState({ total: 0, counts: {} });
+    
 
-    // 즉시 수집 개월 수 / 백그라운드 반복 주기 (검색창 옆 입력창)
+    // '검색주기설정' 옆 상시 노출 입력창 2개 - 현시점 기준 최근 몇 개월 자료를 가져올지,
+    // 몇 시간마다 백그라운드로 재수집할지. 예전엔 ⚙ 토글 버튼을 눌러야 나오는
+    // 팝오버였는데 없애고 상시 노출로 단순화, 이후 '실시간 수집'이 즉시 수집을
+    // 전담하면서 잠깐 months_back을 뺐다가 다시 복원함 (8/7 세션 후반).
     const [monthsBack, setMonthsBack] = useState(1);
     const [intervalHours, setIntervalHours] = useState(24);
-    const [showCollectOptions, setShowCollectOptions] = useState(false);
+    const [showIntervalPopover, setShowIntervalPopover] = useState(false);
 
     // 소스 관리 패널
     const [showSourceManager, setShowSourceManager] = useState(false);
@@ -97,18 +176,32 @@ function App() {
     const [newSource, setNewSource] = useState({ name: '', url: '', category: '', interval_hours: 3 });
     const [tickMinutes, setTickMinutes] = useState(30);
 
+    // 소스 관리 테이블 - 접기/펼치기 + 필터 상태
+    const [collapsedCategories, setCollapsedCategories] = useState(new Set());
+    const [categoryFilter, setCategoryFilter] = useState(null);   // null = 전체
+    const [showFailingOnly, setShowFailingOnly] = useState(false); // 탈락 후보만 보기
+
+    // 삭제 버튼 - 브라우저 confirm() 대신 인라인 확인/취소. 한 번에 하나의 행만
+    // 확인 상태를 가지도록 id 하나만 저장한다 (다른 행 삭제 버튼을 누르면 자동 전환).
+    const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+    // 출처별 수집 건수 (기존 "출처 보기" 패널의 데이터를 출처 관리 테이블에 통합)
+    const [sourceCounts, setSourceCounts] = useState({}); // { [소스이름]: 건수 }
+
+    // 키워드 관리(삭제) 패널 - "키워드별 현황"의 "전체 보기" 버튼에서 연다.
+    const [showKeywordManager, setShowKeywordManager] = useState(false);
+    const [registeredKeywords, setRegisteredKeywords] = useState([]);
+    // 삭제 버튼 클릭 시 브라우저 기본 confirm() 대신, 그 자리 바로 옆에 확인/취소를
+    // 인라인으로 보여주기 위한 상태 - 지금 확인 중인 키워드 id 하나만 기억한다.
+    const [confirmDeleteKeywordId, setConfirmDeleteKeywordId] = useState(null);
+
     // 재클릭 시 진행 중인 작업을 중단하기 위한 개별 상태/컨트롤러.
     // 예전엔 loading 하나를 모든 버튼이 공유해서, 하나가 실행 중이면 나머지
     // 버튼까지 전부 disabled로 잠겨 "눌러도 반응이 없는" 것처럼 보였다.
-    // 이제 액션별로 독립된 pending 상태를 쓰고, 오래 걸리는 두 액션(파이프라인
-    // 수집/검색·등록)은 AbortController + 백엔드 /collect/cancel로 실제 중단도 지원한다.
+    // 이제 액션별로 독립된 pending 상태를 쓰고, 시간이 걸리는 실시간 수집은
+    // AbortController + 백엔드 /collect/cancel로 실제 중단도 지원한다.
     const pipelineControllerRef = useRef(null);
     const [pipelinePending, setPipelinePending] = useState(false);
-
-    const searchControllerRef = useRef(null);
-    const [searchPending, setSearchPending] = useState(false);
-
-    const [sourceStatsPending, setSourceStatsPending] = useState(false);
 
     // 개인저장방(Vault)
     const [vaultFolders, setVaultFolders] = useState([]);
@@ -272,6 +365,10 @@ function App() {
             setPipelinePending(false);
             toast.dismiss();
             toast('파이프라인 수집을 중단했습니다.');
+            // 토스트는 몇 초 뒤 사라지지만, 화면에 계속 남는 고정 메시지 박스(message)는
+            // 여기서 갱신해주지 않으면 시작할 때 찍힌 "점검하고 있습니다..." 문구가
+            // 영원히 남아있게 된다 (8/7 세션에서 발견된 버그) - 함께 갱신한다.
+            setMessage('⏹ 파이프라인 수집을 사용자 요청으로 중단했습니다.');
             return;
         }
 
@@ -291,20 +388,20 @@ function App() {
 
         try {
             const url = targetKeyword
-                ? `${API_URL}/collect/deep-incremental?keyword=${encodeURIComponent(targetKeyword)}`
+                ? `${API_URL}/collect/deep-incremental?keyword=${encodeURIComponent(targetKeyword)}&months_back=${monthsBack}&interval_hours=${intervalHours}`
                 : `${API_URL}/collect/deep-incremental`;
 
             const response = await axios.get(url, { signal: controller.signal });
             const detail = response.data.detail || {};
 
             const detailMsg = targetKeyword
-                ? `✨ '${targetKeyword}' 키워드 수집 완료! (신규 ${response.data.total_count}건)`
+                ? response.data.message  // 백엔드가 상황(신규 등록/재수집)에 맞는 메시지를 만들어 보내줌
                 : `✨ 파이프라인 수집 완료! (총 신규: ${response.data.total_count}건)\n` +
                 `• 고정 소스: ${detail.sources_checked ?? 0}건 점검 (신규 ${detail.sources_new_articles ?? 0}건)\n` +
                 `• 키워드: ${detail.keywords_checked ?? 0}건 점검 (신규 ${detail.keywords_new_articles ?? 0}건)`;
 
             setMessage(detailMsg);
-            toast.success(`수집 완료! ${response.data.total_count}건 추가됨`, { id: toastId });
+            toast.success(response.data.message || `수집 완료! ${response.data.total_count}건 추가됨`, { id: toastId });
             await fetchArticles(keyword);
             await fetchKeywordStats();
             await fetchSystemStats();
@@ -315,6 +412,14 @@ function App() {
             if (err.response?.status === 404) {
                 toast.error(err.response.data?.detail || '등록되지 않은 키워드입니다.', { id: toastId });
                 setMessage(err.response.data?.detail || '등록되지 않은 키워드입니다.');
+            } else if (err.response?.status === 409) {
+                // 다른 수집 작업(예: DB 재생성 직후 대량 초기 수집)이 이미 진행 중이라 백엔드가
+                // 거부한 것 - 에러라기보다 "잠깐 기다려야 함" 안내에 가깝다. 사용자가 이 타이밍을
+                // 놓쳐도 알아서 처리되도록 3초 후 자동으로 한 번 더 시도한다.
+                const msg = err.response.data?.detail || '다른 수집 작업이 진행 중입니다.';
+                toast(`${msg} 3초 후 자동으로 다시 시도합니다.`, { id: toastId, icon: '⏳', duration: 3500 });
+                setMessage(`${msg} 3초 후 자동으로 다시 시도합니다.`);
+                setTimeout(() => { handleCollectPipeline(); }, 3000);
             } else {
                 console.error("파이프라인 수집 에러:", err);
                 setMessage('파이프라인 수집 중 에러가 발생했습니다.');
@@ -326,28 +431,16 @@ function App() {
         }
     };
 
-    const handleToggleSourceStats = async () => {
-        if (showSourceStats) {
-            setShowSourceStats(false);
-            return;
-        }
-
-        setSourceStatsPending(true);
+    // 출처별 수집 건수 조회 - 예전엔 별도 "출처 보기" 패널용이었지만,
+    // 이제 출처 관리 테이블을 열 때 함께 불러와서 건수 열에 바로 채운다.
+    const fetchSourceCounts = useCallback(async () => {
         try {
             const response = await axios.get(`${API_URL}/stats/sources`);
-            const total = response.data.total_articles;
-            const counts = response.data.source_counts || {};
-            
-            setSourceStatsData({ total, counts });
-            setShowSourceStats(true);
+            setSourceCounts(response.data.source_counts || {});
         } catch (err) {
-            console.error("출처 통계 조회 에러:", err);
-            setMessage('출처별 통계를 조회하는 중 에러가 발생했습니다.');
-            toast.error('통계 조회 실패');
-        } finally {
-            setSourceStatsPending(false);
+            console.error("출처별 건수 조회 에러:", err);
         }
-    };
+    }, [API_URL]);
 
     const handleCleanExisting = async () => {
         const toastId = toast.loading('데이터 정제 중...');
@@ -545,77 +638,126 @@ function App() {
         }
     };
 
-    const handleSearch = async (e) => {
+    // 검색어 입력창에서 Enter를 누르면 바로 옆의 '실시간 수집'이 실행되도록 - 인접한
+    // 두 요소를 하나의 폼으로 묶어서 Enter 키 동작을 자연스럽게 만든다.
+    const handleRealtimeSubmit = (e) => {
+        e.preventDefault();
+        handleCollectPipeline();
+    };
+
+    // '검색주기설정' 버튼: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
+    // 저장해야 실제로 반영된다. 즉시 수집은 하지 않고, 키워드를 등록하거나(없으면)
+    // 이미 있으면 개월수/검색 주기만 갱신한다. 지금 당장 수집하고 싶으면
+    // '실시간 수집' 버튼을 쓰면 된다 - 두 버튼의 역할을 명확히 분리 (8/7 세션 후반).
+    // DB 쓰기 한 번뿐이라 오래 걸리지 않으므로 취소 로직은 두지 않았다.
+    const handleSetSearchInterval = async (e) => {
         e.preventDefault();
         if (!keyword.trim()) {
             toast('검색어를 입력해주세요.');
             return;
         }
 
-        // 이미 진행 중이면: 재클릭은 "중단"으로 동작한다.
-        if (searchControllerRef.current) {
-            searchControllerRef.current.abort();
-            searchControllerRef.current = null;
-            try { await axios.post(`${API_URL}/collect/cancel`); } catch (_) { /* 무시 */ }
-            setSearchPending(false);
-            toast.dismiss();
-            toast('검색/등록을 중단했습니다.');
-            return;
-        }
-
-        const controller = new AbortController();
-        searchControllerRef.current = controller;
-        setSearchPending(true);
-        const toastId = toast.loading(`'${keyword}' 키워드 확인 중... (다시 누르면 중단)`);
-
+        const toastId = toast.loading(`'${keyword}' 검색 주기 설정 중...`);
         try {
-            const response = await axios.post(`${API_URL}/keywords`, {
+            const response = await axios.put(`${API_URL}/keywords/interval`, {
                 name: keyword.trim(),
                 months_back: monthsBack,
                 interval_hours: intervalHours,
-            }, { signal: controller.signal });
+            });
             toast.success(response.data.message, { id: toastId });
-            await fetchArticles(keyword);
+            setShowIntervalPopover(false);
             await fetchKeywordStats();
+            if (showKeywordManager) {
+                await fetchRegisteredKeywords();
+            }
         } catch (err) {
-            if (axios.isCancel(err) || err.code === 'ERR_CANCELED') {
-                return; // 위에서 이미 중단 안내 토스트를 띄웠음
-            }
-            if (err.response?.status === 400) {
-                // 이미 등록된 키워드 - 그냥 무시하지 않고 강제 재수집을 시도한다.
-                try {
-                    const listRes = await axios.get(`${API_URL}/keywords`);
-                    const existing = (listRes.data.keywords || []).find(
-                        (k) => k.name === keyword.trim()
-                    );
-                    if (existing) {
-                        toast.loading(`'${keyword}' 재수집 중... (다시 누르면 중단)`, { id: toastId });
-                        const recollectRes = await axios.post(
-                            `${API_URL}/keywords/${existing.id}/recollect`,
-                            {},
-                            { signal: controller.signal }
-                        );
-                        toast.success(recollectRes.data.message, { id: toastId });
-                        await fetchArticles(keyword);
-                        await fetchKeywordStats();
-                    } else {
-                        toast.dismiss(toastId);
-                    }
-                } catch (recollectErr) {
-                    if (axios.isCancel(recollectErr) || recollectErr.code === 'ERR_CANCELED') {
-                        return;
-                    }
-                    console.error("재수집 에러:", recollectErr);
-                    toast.error('재수집 중 오류가 발생했습니다.', { id: toastId });
-                }
-            } else {
-                console.error("키워드 등록 에러:", err);
-                toast.error('키워드 등록 중 오류가 발생했습니다.', { id: toastId });
-            }
-        } finally {
-            searchControllerRef.current = null;
-            setSearchPending(false);
+            console.error("검색 주기 설정 에러:", err);
+            toast.error('검색 주기 설정 중 오류가 발생했습니다.', { id: toastId });
         }
+    };
+
+    // 검색창에 이미 등록된 키워드 이름을 입력하고 포커스를 벗어나면, 그 키워드의
+    // 기존 설정(최근 N개월/N시간 주기)을 불러와 입력창에 미리 채워준다.
+    // "검색주기설정을 다시 눌러서 수정한다"는 게, 지금 어떤 값으로 돼있는지도
+    // 모른 채 덮어쓰는 게 아니라 기존 값을 보고 조정할 수 있게 하기 위함.
+    const handleKeywordInputBlur = async () => {
+        const name = keyword.trim();
+        if (!name) return;
+        try {
+            const res = await axios.get(`${API_URL}/keywords`);
+            const existing = (res.data.keywords || []).find(k => k.name === name);
+            if (existing) {
+                setMonthsBack(existing.months_back);
+                setIntervalHours(existing.interval_hours);
+            }
+        } catch (_) {
+            // 불러오기는 부가 기능이라 실패해도 조용히 넘어감 (입력 자체는 계속 가능해야 함)
+        }
+    };
+
+    // 등록된 키워드 전체 목록 (키워드 관리 패널용)
+    const fetchRegisteredKeywords = useCallback(async () => {
+        try {
+            const response = await axios.get(`${API_URL}/keywords`);
+            setRegisteredKeywords(response.data.keywords || []);
+        } catch (err) {
+            console.error("키워드 목록 조회 에러:", err);
+        }
+    }, [API_URL]);
+
+    // 키워드 삭제 - 등록 취소와 함께, 그 키워드로 수집된 기사도 백엔드에서 전부
+    // 함께 삭제된다 (8/7 세션 후반 - 이전엔 기사를 남겼으나 완전 삭제로 변경).
+    // 브라우저 기본 confirm() 팝업 대신, 삭제 버튼 자리에 바로 확인/취소가 나오도록
+    // 2단계로 나눔: 🗑️ 클릭 -> 확인/취소 인라인 노출 -> 확인 클릭 시 실제 삭제.
+    const handleRequestDeleteKeyword = (keywordId) => {
+        setConfirmDeleteKeywordId(keywordId);
+    };
+
+    const handleCancelDeleteKeyword = () => {
+        setConfirmDeleteKeywordId(null);
+    };
+
+    const handleConfirmDeleteKeyword = async (keywordId) => {
+        setConfirmDeleteKeywordId(null);
+        const toastId = toast.loading('키워드와 관련 기사 삭제 중...');
+        try {
+            const response = await axios.delete(`${API_URL}/keywords/${keywordId}`);
+            toast.success(response.data.message, { id: toastId });
+            await fetchRegisteredKeywords();
+            await fetchKeywordStats();
+            await fetchArticles(keyword);
+        } catch (err) {
+            console.error("키워드 삭제 에러:", err);
+            toast.error('삭제 실패', { id: toastId });
+        }
+    };
+
+    // 키워드 관리 패널의 "게시 날짜" 컬럼 - 그 키워드로 모은 기사들의 published_at 중
+    // 가장 이른 날짜 ~ 가장 늦은 날짜를 "YYYY.MM.DD ~ YYYY.MM.DD" 형태로 보여준다.
+    const formatKeywordDateRange = (earliestIso, latestIso) => {
+        if (!earliestIso || !latestIso) return '날짜 정보 없음';
+        const fmt = (iso) => {
+            const d = new Date(iso);
+            return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
+        };
+        const start = fmt(earliestIso);
+        const end = fmt(latestIso);
+        return start === end ? start : `${start} ~ ${end}`;
+    };
+
+    // "전체 보기" 버튼: 필터를 초기화하는 기존 기능 + 등록된 키워드를 관리(삭제)할
+    // 수 있는 패널을 여닫는 기능을 함께 담당한다 (8/7 세션 후반 요청 반영).
+    const handleToggleAllView = async () => {
+        setKeyword('');
+        await fetchArticles('');
+        setConfirmDeleteKeywordId(null);
+
+        if (showKeywordManager) {
+            setShowKeywordManager(false);
+            return;
+        }
+        await fetchRegisteredKeywords();
+        setShowKeywordManager(true);
     };
 
     const handleStatClick = async (targetKw) => {
@@ -628,9 +770,10 @@ function App() {
     const handleToggleSourceManager = async () => {
         if (showSourceManager) {
             setShowSourceManager(false);
+            setConfirmDeleteId(null);
             return;
         }
-        await fetchSources();
+        await Promise.all([fetchSources(), fetchSourceCounts()]);
         try {
             const res = await axios.get(`${API_URL}/scheduler/config`);
             setTickMinutes(res.data.tick_minutes);
@@ -664,15 +807,18 @@ function App() {
     };
 
     const handleDeleteSource = async (sourceId) => {
-        if (!window.confirm("이 소스를 삭제하시겠습니까?")) return;
+        // 확인은 이제 버튼 클릭 시점(인라인 UI)에서 이미 끝난 상태이므로
+        // 여기서는 실제 삭제만 수행한다. window.confirm은 더 이상 쓰지 않는다.
         const toastId = toast.loading('삭제 중...');
         try {
             const response = await axios.delete(`${API_URL}/sources/${sourceId}`);
             toast.success(response.data.message, { id: toastId });
+            setConfirmDeleteId(null);
             await fetchSources();
         } catch (err) {
             console.error("소스 삭제 에러:", err);
             toast.error('삭제 실패', { id: toastId });
+            setConfirmDeleteId(null);
         }
     };
 
@@ -729,11 +875,9 @@ function App() {
         }
     };
 
-    const handleKeyDown = (e) => {
-        if (e.key === 'Enter') {
-            handleSearch(e);
-        }
-    };
+    // Enter 키는 <form onSubmit>이 이미 네이티브로 처리하므로 별도 핸들러 불필요
+    // (예전엔 onKeyDown으로 따로도 호출해서 Enter 한 번에 요청이 두 번 나가던 잠재 버그가
+    // 있었음 - 8/7 세션 후반에 발견 및 제거).
 
     // ============================================
     // 마크다운 컴포넌트 설정
@@ -961,69 +1105,62 @@ function App() {
 
             <div className="control-panel">
                 <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
-                    <button 
-                        className="collect-btn" 
-                        onClick={handleCollectPipeline}
-                    >
-                        {pipelinePending ? '⏹ 중단 (클릭)' : '⚡ 파이프라인 수집'}
-                    </button>
-
-                    <form onSubmit={handleSearch} className="search-form">
+                    {/* 검색어 입력창 바로 옆에 실시간 수집 - Enter 키로도 바로 실행되도록 한 폼으로 묶음 */}
+                    <form onSubmit={handleRealtimeSubmit} className="search-form">
                         <input 
                             type="text" 
                             placeholder="검색어 입력 (예: 테슬라, AI, 정치)" 
                             value={keyword} 
                             onChange={(e) => setKeyword(e.target.value)}
-                            onKeyDown={handleKeyDown}
+                            onBlur={handleKeywordInputBlur}
                         />
-                        <div className="search-btn-group">
-                            <button type="submit" className="search-btn">
-                                {searchPending ? '⏹ 중단 (클릭)' : '🔍 검색/등록'}
-                            </button>
-                            <button
-                                type="button"
-                                className="search-btn-options-toggle"
-                                onClick={() => setShowCollectOptions(!showCollectOptions)}
-                                title="수집 옵션 설정"
-                            >
-                                ⚙
-                            </button>
-
-                            {showCollectOptions && (
-                                <div className="search-collect-options-popover">
-                                    <label>
-                                        최근
-                                        <input
-                                            type="number"
-                                            min="1"
-                                            value={monthsBack}
-                                            onChange={(e) => setMonthsBack(Number(e.target.value))}
-                                        />
-                                        개월 즉시 수집
-                                    </label>
-                                    <label>
-                                        <input
-                                            type="number"
-                                            min="1"
-                                            value={intervalHours}
-                                            onChange={(e) => setIntervalHours(Number(e.target.value))}
-                                        />
-                                        시간마다 백그라운드 반복
-                                    </label>
-                                </div>
-                            )}
-                        </div>
+                        <button type="submit" className="collect-btn">
+                            {pipelinePending ? '⏹ 중단 (클릭)' : '⚡ 실시간 수집'}
+                        </button>
                     </form>
+
+                    {/* 검색주기설정: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
+                        저장을 눌러야 실제로 반영된다 (8/7 세션 후반 - 상시 노출 대신 토글로 변경) */}
+                    <div style={{ position: 'relative' }}>
+                        <button
+                            type="button"
+                            className="collect-btn"
+                            style={{ backgroundColor: showIntervalPopover ? '#0d9488' : '#14b8a6' }}
+                            onClick={() => setShowIntervalPopover(!showIntervalPopover)}
+                        >
+                            ⏱️ 검색주기설정
+                        </button>
+
+                        {showIntervalPopover && (
+                            <form onSubmit={handleSetSearchInterval} className="search-collect-options-popover">
+                                <label>
+                                    최근
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        value={monthsBack}
+                                        onChange={(e) => setMonthsBack(Number(e.target.value))}
+                                    />
+                                    개월 이내 자료
+                                </label>
+                                <label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        value={intervalHours}
+                                        onChange={(e) => setIntervalHours(Number(e.target.value))}
+                                    />
+                                    시간마다 재수집
+                                </label>
+                                <button type="submit" className="search-btn">
+                                    저장
+                                </button>
+                            </form>
+                        )}
+                    </div>
                 </div>
 
                 <div style={{ display: 'flex', gap: '10px', marginLeft: 'auto' }}>
-                    <button 
-                        className="collect-btn" 
-                        style={{ backgroundColor: showSourceStats ? '#0284c7' : '#0ea5e9' }}
-                        onClick={handleToggleSourceStats}
-                    >
-                        {sourceStatsPending ? '⏳ 조회 중...' : (showSourceStats ? '📂 출처 닫기' : '📂 출처 보기')}
-                    </button>
 
                     <button 
                         className="collect-btn" 
@@ -1039,7 +1176,7 @@ function App() {
                         style={{ backgroundColor: showSourceManager ? '#7c3aed' : '#8b5cf6' }}
                         onClick={handleToggleSourceManager}
                     >
-                        ⚙️ 소스 관리
+                        ⚙️ 출처 관리
                     </button>
                 </div>
             </div>
@@ -1052,18 +1189,6 @@ function App() {
                 </div>
             )}
 
-            {showSourceStats && (
-                <div className="source-stats-panel">
-                    <h3>📂 출처별 저장 현황 (총 {sourceStatsData.total}건)</h3>
-                    <div>
-                        {Object.entries(sourceStatsData.counts).map(([name, count]) => (
-                            <div key={name}>
-                                {name}: <strong>{count}건</strong>
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            )}
 
             {showSourceManager && (
                 <div className="source-manager-panel">
@@ -1109,44 +1234,237 @@ function App() {
                     </div>
 
                     <div className="source-manager-list">
-                        {sourcesList.length === 0 ? (
-                            <p style={{ margin: 0, color: '#94a3b8' }}>등록된 소스가 없습니다.</p>
-                        ) : (
-                            sourcesList.map(src => (
-                                <div key={src.id} className={`source-row ${src.status === 'failing' ? 'source-row-failing' : ''}`}>
-                                    <span className="source-row-name">{src.name}</span>
-                                    <span className="source-row-badge">{src.origin}</span>
-                                    <span className="source-row-badge">{src.source_type}</span>
-                                    {src.status === 'failing' && (
-                                        <span className="source-row-warning">⚠️ 탈락 후보 (연속 {src.fail_count}회 실패)</span>
-                                    )}
-                                    <span className="source-row-interval">
-                                        <input
-                                            type="number"
-                                            min="0.5"
-                                            step="0.5"
-                                            defaultValue={src.interval_hours}
-                                            style={{ width: '50px' }}
-                                            onBlur={(e) => {
-                                                const v = Number(e.target.value);
-                                                if (v > 0 && v !== src.interval_hours) {
-                                                    handleUpdateSourceInterval(src.id, v);
+                        <div className="source-filter-bar">
+                            <button
+                                className={`source-filter-chip ${!categoryFilter && !showFailingOnly ? 'active' : ''}`}
+                                onClick={() => { setCategoryFilter(null); setShowFailingOnly(false); }}
+                            >
+                                전체 ({sourcesList.length})
+                            </button>
+                            {getCategoryCounts(sourcesList).map(({ category, count }) => (
+                                <button
+                                    key={category}
+                                    className={`source-filter-chip ${categoryFilter === category ? 'active' : ''}`}
+                                    onClick={() => {
+                                        setShowFailingOnly(false);
+                                        setCategoryFilter((prev) => (prev === category ? null : category));
+                                    }}
+                                >
+                                    {category} ({count})
+                                </button>
+                            ))}
+                            <button
+                                className={`source-filter-chip source-filter-chip-warning ${showFailingOnly ? 'active' : ''}`}
+                                onClick={() => {
+                                    setCategoryFilter(null);
+                                    setShowFailingOnly((prev) => !prev);
+                                }}
+                            >
+                                ⚠️ 탈락 후보 ({sourcesList.filter(isFailingCandidate).length})
+                            </button>
+                        </div>
+
+                        {(() => {
+                            const filtered = applySourceFilters(sourcesList, categoryFilter, showFailingOnly);
+                            if (filtered.length === 0) {
+                                return (
+                                    <p style={{ margin: 0, color: '#94a3b8' }}>
+                                        {sourcesList.length === 0
+                                            ? '등록된 소스가 없습니다.'
+                                            : '이 필터에 해당하는 소스가 없습니다.'}
+                                    </p>
+                                );
+                            }
+
+                            return (
+                                <div className="source-table-scroll">
+                                    <table className="source-table">
+                                        <colgroup>
+                                            <col style={{ width: '110px' }} />  {/* 카테고리 */}
+                                            <col style={{ width: '22%' }} />    {/* 소스 */}
+                                            <col style={{ width: '60px' }} />   {/* 건수 */}
+                                            <col style={{ width: '64px' }} />   {/* 구분 */}
+                                            <col />                              {/* URL - 남는 공간 전부 */}
+                                            <col style={{ width: '70px' }} />   {/* 주기 */}
+                                            <col style={{ width: '56px' }} />   {/* 삭제 */}
+                                        </colgroup>
+                                        <thead>
+                                            <tr>
+                                                <th>카테고리</th>
+                                                <th>소스</th>
+                                                <th>건수</th>
+                                                <th>구분</th>
+                                                <th>URL</th>
+                                                <th>주기</th>
+                                                <th></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {groupSourcesByCategory(filtered).map((group) => {
+                                                const isCollapsed = collapsedCategories.has(group.category);
+                                                const hasFailing = group.sources.some(isFailingCandidate);
+
+                                                const toggleCollapse = () => {
+                                                    setCollapsedCategories((prev) => {
+                                                        const next = new Set(prev);
+                                                        if (next.has(group.category)) {
+                                                            next.delete(group.category);
+                                                        } else {
+                                                            next.add(group.category);
+                                                        }
+                                                        return next;
+                                                    });
+                                                };
+
+                                                if (isCollapsed) {
+                                                    return (
+                                                        <tr key={group.category} className="source-table-category-row-collapsed">
+                                                            <td
+                                                                className="source-table-category"
+                                                                colSpan={7}
+                                                                onClick={toggleCollapse}
+                                                                style={{ cursor: 'pointer' }}
+                                                            >
+                                                                <span className="source-table-category-toggle">▶</span>
+                                                                {group.category}
+                                                                {isSensitiveCategory(group.category) && (
+                                                                    <span
+                                                                        className="source-table-sensitive-badge"
+                                                                        title="민감 카테고리 — 개인화 프로필에서 결론 유도가 아닌 정보 필터링 용도로만 사용"
+                                                                    >
+                                                                        ⚠️
+                                                                    </span>
+                                                                )}
+                                                                {hasFailing && (
+                                                                    <span
+                                                                        className="source-table-category-failing-badge"
+                                                                        title="이 카테고리에 탈락 후보(연속 3회 이상 실패)가 포함되어 있습니다"
+                                                                    >
+                                                                        ⚠️
+                                                                    </span>
+                                                                )}
+                                                                <span className="source-table-category-count">
+                                                                    {group.sources.length}개 · 펼치려면 클릭
+                                                                </span>
+                                                            </td>
+                                                        </tr>
+                                                    );
                                                 }
-                                            }}
-                                        />
-                                        시간 주기 · 다음 점검: {formatNextCheck(src.last_attempt_at, src.interval_hours)}
-                                    </span>
-                                    <button onClick={() => handleDeleteSource(src.id)} className="source-row-delete">🗑️</button>
+
+                                                return group.sources.map((src, idx) => (
+                                                    <tr
+                                                        key={src.id}
+                                                        className={src.status === 'failing' ? 'source-row-failing' : ''}
+                                                    >
+                                                        {idx === 0 && (
+                                                            <td
+                                                                className="source-table-category"
+                                                                rowSpan={group.sources.length}
+                                                                onClick={toggleCollapse}
+                                                                style={{ cursor: 'pointer' }}
+                                                            >
+                                                                <span className="source-table-category-toggle">▼</span>
+                                                                {group.category}
+                                                                {isSensitiveCategory(group.category) && (
+                                                                    <span
+                                                                        className="source-table-sensitive-badge"
+                                                                        title="민감 카테고리 — 개인화 프로필에서 결론 유도가 아닌 정보 필터링 용도로만 사용"
+                                                                    >
+                                                                        ⚠️
+                                                                    </span>
+                                                                )}
+                                                                {hasFailing && (
+                                                                    <span
+                                                                        className="source-table-category-failing-badge"
+                                                                        title="이 카테고리에 탈락 후보(연속 3회 이상 실패)가 포함되어 있습니다"
+                                                                    >
+                                                                        ⚠️
+                                                                    </span>
+                                                                )}
+                                                                <span className="source-table-category-count">
+                                                                    {group.sources.length}개
+                                                                </span>
+                                                            </td>
+                                                        )}
+                                                        <td className="source-table-name">
+                                                            {src.name}
+                                                            {src.status === 'failing' && (
+                                                                <span className="source-row-warning">
+                                                                    {' '}⚠️ 연속 {src.fail_count}회 실패
+                                                                </span>
+                                                            )}
+                                                        </td>
+                                                        <td className="source-table-count-cell">
+                                                            {(sourceCounts[src.name] ?? 0)}건
+                                                        </td>
+                                                        <td>
+                                                            <span
+                                                                className={`source-origin-badge ${isAutoOrigin(src.origin) ? 'auto' : 'manual'}`}
+                                                            >
+                                                                {isAutoOrigin(src.origin) ? '자동' : '수동'}
+                                                            </span>
+                                                        </td>
+                                                        <td className="source-table-url" title={src.url}>
+                                                            <a href={src.url} target="_blank" rel="noreferrer">
+                                                                {src.url}
+                                                            </a>
+                                                        </td>
+                                                        <td className="source-table-interval">
+                                                            <input
+                                                                type="number"
+                                                                min="0.5"
+                                                                step="0.5"
+                                                                defaultValue={src.interval_hours}
+                                                                style={{ width: '50px' }}
+                                                                title={`다음 점검: ${formatNextCheck(src.last_attempt_at, src.interval_hours)}`}
+                                                                onBlur={(e) => {
+                                                                    const v = Number(e.target.value);
+                                                                    if (v > 0 && v !== src.interval_hours) {
+                                                                        handleUpdateSourceInterval(src.id, v);
+                                                                    }
+                                                                }}
+                                                            />
+                                                        </td>
+                                                        <td className="source-table-delete-cell">
+                                                            {confirmDeleteId === src.id ? (
+                                                                <span className="source-delete-confirm">
+                                                                    <button
+                                                                        onClick={() => handleDeleteSource(src.id)}
+                                                                        className="source-delete-confirm-yes"
+                                                                    >
+                                                                        확인
+                                                                    </button>
+                                                                    <button
+                                                                        onClick={() => setConfirmDeleteId(null)}
+                                                                        className="source-delete-confirm-no"
+                                                                    >
+                                                                        취소
+                                                                    </button>
+                                                                </span>
+                                                            ) : (
+                                                                <button
+                                                                    onClick={() => setConfirmDeleteId(src.id)}
+                                                                    className="source-row-delete"
+                                                                >
+                                                                    🗑️
+                                                                </button>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ));
+                                            })}
+                                        </tbody>
+                                    </table>
                                 </div>
-                            ))
-                        )}
+                            );
+                        })()}
                     </div>
                 </div>
             )}
 
             <div className="stats-section">
                 <p>
-                    총 저장된 항목: <strong>{articles.length}건</strong> 
+                    총 저장된 출처: <strong>{new Set(articles.map(a => a.source)).size}건</strong> 
                     {keyword && ` (검색어: "${keyword}")`}
                 </p>
                 <div className="keyword-stats-bar">
@@ -1160,19 +1478,74 @@ function App() {
                             {kw}: <strong>{count}건</strong>
                         </button>
                     ))}
-                    {keyword && (
-                        <button 
-                            className="stat-badge-btn"
-                            style={{ backgroundColor: '#374151', color: '#ffffff' }}
-                            onClick={() => {
-                                setKeyword('');
-                                fetchArticles('');
-                            }}
-                        >
-                            전체 보기 ↺
-                        </button>
-                    )}
+                    <button 
+                        className="stat-badge-btn"
+                        style={{ backgroundColor: showKeywordManager ? '#4b5563' : '#374151', color: '#ffffff' }}
+                        onClick={handleToggleAllView}
+                        title="필터 해제 + 등록된 키워드 관리(삭제)"
+                    >
+                        전체 보기 {showKeywordManager ? '▲' : '↺'}
+                    </button>
                 </div>
+
+                {showKeywordManager && (
+                    <div className="source-manager-panel" style={{ marginTop: '12px' }}>
+                        <h4 style={{ margin: '0 0 10px 0', color: '#94a3b8', fontSize: '0.85rem' }}>
+                            🔑 등록된 키워드 관리 (총 {registeredKeywords.length}개)
+                        </h4>
+                        <div
+                            className="source-manager-list"
+                            style={{ maxHeight: '50vh', overflowY: 'auto', display: 'block' }}
+                        >
+                            {registeredKeywords.length === 0 ? (
+                                <p style={{ margin: 0, color: '#94a3b8' }}>등록된 키워드가 없습니다.</p>
+                            ) : (
+                                registeredKeywords.map(kw => (
+                                    <div key={kw.id} className="source-row">
+                                        <span className="source-row-name">{kw.name}</span>
+                                        <span className="source-row-badge">{kw.article_count}건</span>
+                                        <span className="source-row-interval">
+                                            {formatKeywordDateRange(kw.earliest_published_at, kw.latest_published_at)}
+                                        </span>
+
+                                        {confirmDeleteKeywordId === kw.id ? (
+                                            <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                                <span style={{ fontSize: '0.78rem', color: '#f87171' }}>삭제할까요?</span>
+                                                <button
+                                                    onClick={() => handleConfirmDeleteKeyword(kw.id)}
+                                                    style={{
+                                                        backgroundColor: '#dc2626', color: '#fff', border: 'none',
+                                                        borderRadius: '4px', padding: '3px 10px', fontSize: '0.78rem',
+                                                        cursor: 'pointer', fontWeight: 'bold'
+                                                    }}
+                                                >
+                                                    확인
+                                                </button>
+                                                <button
+                                                    onClick={handleCancelDeleteKeyword}
+                                                    style={{
+                                                        backgroundColor: '#374151', color: '#fff', border: 'none',
+                                                        borderRadius: '4px', padding: '3px 10px', fontSize: '0.78rem',
+                                                        cursor: 'pointer'
+                                                    }}
+                                                >
+                                                    취소
+                                                </button>
+                                            </span>
+                                        ) : (
+                                            <button
+                                                onClick={() => handleRequestDeleteKeyword(kw.id)}
+                                                className="source-row-delete"
+                                            >
+                                                🗑️
+                                            </button>
+                                        )}
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+                )}
             </div>
 
             <div className="article-list">

@@ -245,3 +245,57 @@ class SchedulerConfig(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     tick_minutes: int = Field(default=30)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+# -*- coding: utf-8 -*-
+"""
+models_addon_interaction_signal.py
+------------------------------------
+이 내용을 기존 models.py 맨 끝에 그대로 붙여넣으세요 (import는 이미 models.py
+상단에 있는 것들만 사용하므로 추가 import 불필요 — Optional, SQLModel, Field,
+datetime 이미 있음).
+
+기존 UserPreference 테이블(categories/keywords를 JSON 문자열로 뭉뚱그려 저장)은
+그대로 두고 건드리지 않는다. 대신 "신호 하나하나의 원본 로그"를 남기는 새 테이블을
+추가한다 — UserPreference는 나중에 이 로그로부터 집계된 요약본을 캐싱하는 용도로
+계속 쓸 수 있다 (지금 당장은 비워두고, personalization.py가 즉석 계산으로 대체).
+
+__tablename__ 복수형 규칙 유지: interaction_signals
+"""
+
+
+class InteractionSignal(SQLModel, table=True):
+    """
+    개인화 프로필의 원재료가 되는 신호 원본 로그.
+    - 브라우저 확장 이벤트, 대화 발화, 명시적 피드백(👍👎) 모두 이 한 테이블에 쌓인다.
+    - 절대 UPDATE하지 않는다 (append-only 로그). 집계는 항상 조회 시점에 계산한다
+      (raw_content를 절대 안 건드리는 Article 원칙과 같은 이유 — 나중에 다른 방식으로
+      재집계하고 싶을 때 원본이 훼손되지 않아야 하기 때문).
+    """
+    __tablename__ = "interaction_signals"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    # 어떤 기사/맥락에서 나온 신호인지 (없을 수도 있음 - 예: 순수 채팅 질문)
+    article_id: Optional[int] = Field(default=None, foreign_key="articles.id", index=True)
+
+    source: str = Field(index=True)
+    # "extension" | "chat" | "feedback_explicit"
+
+    subcategory: str = Field(index=True)
+    # personalization_taxonomy.SUBCATEGORY_CONFIG 의 코드 (예: "ECON.STOCK")
+
+    top_category: str = Field(index=True)
+    # 기존 CATEGORY_CONFIG 키와 동일한 값 (예: "Economy") - 조인 없이 바로 집계하기 위한 비정규화 필드
+
+    signal_type: str = Field(default="implicit")
+    # "explicit" | "implicit"
+
+    confidence: float = Field(default=0.5)
+    weight: float = Field(default=1.0)
+
+    raw_snippet: Optional[str] = None
+    # 원문 일부 (근거 제시용). 너무 길게 넣지 말 것 (제목/발췌 수준 권장).
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    # DB에는 UTC로 저장 (기존 Article.collected_at과 동일한 관례 유지).
+    # KST 표시는 조회/응답 시점에 personalization.py의 to_kst()로 변환한다.

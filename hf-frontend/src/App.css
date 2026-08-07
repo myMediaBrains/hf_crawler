@@ -1344,6 +1344,249 @@ body {
     font-weight: bold;
 }
 
+/* ── 소스 관리 테이블 (카테고리별 그룹핑) ── */
+.source-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+.source-table th {
+    text-align: left;
+    padding: 8px 10px;
+    color: #94a3b8;
+    font-weight: 600;
+    border-bottom: 1px solid #334155;
+}
+
+.source-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid #1e293b;
+    vertical-align: top;
+}
+
+.source-table tr.source-row-failing td {
+    background: rgba(239, 68, 68, 0.08);
+}
+
+.source-table-category {
+    font-weight: 700;
+    color: #e2e8f0;
+    border-right: 1px solid #334155;
+    white-space: nowrap;
+}
+
+.source-table-category-count {
+    display: block;
+    font-weight: 400;
+    font-size: 0.75rem;
+    color: #64748b;
+    margin-top: 2px;
+}
+
+.source-table-sensitive-badge {
+    margin-left: 4px;
+    cursor: help;
+}
+
+.source-table-name {
+    color: #f0f0f0;
+}
+
+.source-origin-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+.source-origin-badge.auto {
+    background: rgba(139, 92, 246, 0.15);
+    color: #a78bfa;
+}
+.source-origin-badge.manual {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+}
+
+.source-table-url {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.source-table-url a {
+    color: #64748b;
+    text-decoration: none;
+}
+.source-table-url a:hover {
+    text-decoration: underline;
+    color: #94a3b8;
+}
+
+.source-table-interval {
+    white-space: nowrap;
+}
+.source-table-next-check {
+    display: block;
+    font-size: 0.75rem;
+    color: #64748b;
+    margin-top: 2px;
+}
+
+/* ── 소스 필터 칩 ── */
+.source-filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.source-filter-chip {
+    background: #0f172a;
+    border: 1px solid #334155;
+    color: #94a3b8;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.source-filter-chip:hover {
+    border-color: #64748b;
+    color: #e2e8f0;
+}
+.source-filter-chip.active {
+    background: #3b82f6;
+    border-color: #3b82f6;
+    color: white;
+    font-weight: 600;
+}
+.source-filter-chip-warning.active {
+    background: #ef4444;
+    border-color: #ef4444;
+}
+
+/* ── 접힌 카테고리 행 ── */
+.source-table-category-row-collapsed td {
+    background: #0f172a;
+}
+.source-table-category-toggle {
+    display: inline-block;
+    width: 14px;
+    color: #64748b;
+}
+
+/* ── 삭제 인라인 확인/취소 ── */
+.source-table-delete-cell {
+    white-space: nowrap;
+}
+
+.source-delete-confirm {
+    display: inline-flex;
+    gap: 4px;
+}
+
+.source-delete-confirm-yes,
+.source-delete-confirm-no {
+    border: none;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.source-delete-confirm-yes {
+    background: #ef4444;
+    color: white;
+}
+.source-delete-confirm-yes:hover {
+    background: #dc2626;
+}
+
+.source-delete-confirm-no {
+    background: #334155;
+    color: #e2e8f0;
+}
+.source-delete-confirm-no:hover {
+    background: #475569;
+}
+
+/* ── 소스 테이블 스크롤 컨테이너 ── */
+.source-table-scroll {
+    min-height: 540px;   /* 소스가 적어도 항상 8행 이상 볼 수 있는 높이는 확보 */
+    max-height: 760px;   /* 소스가 많을 때 스크롤 전까지 보이는 최대 높이 */
+    overflow-y: auto;
+    border: 1px solid #334155;
+    border-radius: 6px;
+}
+
+/* 컬럼 헤더(소스/구분/URL/주기)는 스크롤해도 항상 맨 위에 고정 */
+.source-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: #1e293b;
+}
+
+/* 카테고리 배너 행 - 이제 rowSpan 칸이 아니라 독립된 한 줄(colSpan) 행이라
+   sticky가 안정적으로 동작한다. top 값은 thead 실제 높이(대략 37px)에 맞춘
+   것 - 폰트 크기를 바꾸면 이 값도 같이 조정해야 함. */
+.source-table-category {
+    position: sticky;
+    top: 37px;
+    z-index: 2;
+    background: #1e293b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 0.8rem;
+    padding: 8px 8px;
+}
+
+.source-table-category-toggle {
+    margin-right: 2px;
+}
+
+.source-table-sensitive-badge,
+.source-table-category-failing-badge {
+    margin-left: 3px;
+    font-size: 0.75rem;
+}
+
+.source-table-category-count {
+    margin-left: 4px;
+    font-size: 0.68rem;
+}
+
+.source-table-category-failing-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    font-size: 0.72rem;
+    font-weight: 600;
+    cursor: help;
+}
+
+.source-table-count-cell {
+    text-align: right;
+    color: #cbd5e1;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px) {
+    .source-table-url {
+        max-width: 120px;
+    }
+    .source-table {
+        font-size: 0.78rem;
+    }
+}
+
 .source-manager-list {
     display: flex;
     flex-direction: column;

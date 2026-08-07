@@ -1,5 +1,6 @@
 import asyncio
 import re
+from email.utils import parsedate_to_datetime
 import os
 import json
 import subprocess
@@ -49,6 +50,12 @@ from database import engine, get_session, create_db_and_tables
 from models import (
     Article, Translation, Keyword, Source, CandidateSource, SchedulerConfig,
     SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin,
+)
+
+# 개인화 레이어 import (신규)
+from personalization import (
+    classify_and_store, store_explicit_feedback,
+    get_profile, get_top_interests,
 )
 
 # 환경 변수
@@ -147,6 +154,13 @@ class ContentUpdateRequest(BaseModel):
 
 
 class KeywordCreateRequest(BaseModel):
+    name: str
+    months_back: int = 1
+    interval_hours: float = 24.0
+
+
+class KeywordIntervalSetRequest(BaseModel):
+    """'검색주기설정' 버튼 전용 - 즉시 수집 없이 등록/주기 갱신만 한다."""
     name: str
     months_back: int = 1
     interval_hours: float = 24.0
@@ -409,6 +423,110 @@ def cancel_collection():
     return {"status": "success", "message": "현재 실행 중인 수집 작업이 없습니다."}
 
 
+
+# 1회성 백필 - PROMOTE_THRESHOLD를 3 -> 1로 낮추기 전에 이미 쌓여 있던
+# CandidateSource(status=candidate)를 지금 한 번에 전부 승격시킨다.
+# 여러 번 호출해도 안전하다 (이미 promoted/dropped인 건 건드리지 않고,
+# _promote_candidate() 자체도 같은 url이 이미 Source에 있으면 그냥 건너뜀).
+@app.post("/sources/promote-all-candidates")
+def promote_all_candidates(session: Session = Depends(get_session)):
+    pending = session.exec(
+        select(CandidateSource).where(CandidateSource.status == CandidateStatus.CANDIDATE)
+    ).all()
+
+    promoted_count = 0
+    for candidate in pending:
+        keyword = session.get(Keyword, candidate.keyword_id)
+        if keyword is None:
+            continue  # 키워드가 이미 삭제된 경우 - 승격 불가, 건너뜀
+        candidate.status = CandidateStatus.PROMOTED
+        scheduler_module._promote_candidate(session, keyword, candidate)
+        session.add(candidate)
+        session.commit()
+        promoted_count += 1
+
+    return {
+        "status": "success",
+        "promoted_count": promoted_count,
+        "message": f"기존 후보 {promoted_count}건을 출처로 승격했습니다."
+    }
+
+# 1회성 백필 - PROMOTE_THRESHOLD=1 도입 이전/직후 키워드 광역 검색으로 저장된
+# 기사는 Article.source에 "[키워드] " 접두어가 없어서, 승격된 Source.name과
+# 형식이 안 맞아 건수 집계(/stats/sources)에서 빠졌다. 이 접두어를 소급으로
+# 맞춰준다. 여러 번 호출해도 안전 (이미 접두어가 붙은 기사는 대상에서 제외).
+@app.post("/sources/fix-article-source-names")
+def fix_article_source_names(session: Session = Depends(get_session)):
+    promoted_sources = session.exec(
+        select(Source).where(
+            Source.origin == SourceOrigin.AUTO_PROMOTED,
+            Source.keyword_id.is_not(None),
+        )
+    ).all()
+
+    fixed_count = 0
+    for source in promoted_sources:
+        keyword = session.get(Keyword, source.keyword_id)
+        if keyword is None:
+            continue
+        prefix = f"[{keyword.name}] "
+        if not source.name.startswith(prefix):
+            continue
+        label = source.name[len(prefix):]
+
+        articles = session.exec(
+            select(Article).where(
+                Article.keyword == keyword.name,
+                Article.source == label,
+            )
+        ).all()
+        for article in articles:
+            article.source = source.name
+            session.add(article)
+            fixed_count += 1
+
+    session.commit()
+    return {
+        "status": "success",
+        "fixed_count": fixed_count,
+        "message": f"{fixed_count}건의 기사 출처 표기를 정정했습니다."
+    }
+
+
+# ============================================
+# 개인화 프로필 API (신규)
+# ============================================
+
+class ExplicitFeedbackRequest(BaseModel):
+    article_id: int
+    positive: bool  # True=👍, False=👎
+
+
+@app.post("/personalization/feedback")
+def submit_feedback(request: ExplicitFeedbackRequest, session: Session = Depends(get_session)):
+    """
+    기사 카드에 👍/👎 버튼을 추가하고 여기로 연결한다.
+    프론트에서는 ArticleCard.jsx 하단에 버튼 두 개만 추가하면 됨.
+    """
+    signal = store_explicit_feedback(session, article_id=request.article_id, positive=request.positive)
+    if signal is None:
+        raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없거나 분류할 수 없습니다.")
+    return {"status": "success", "subcategory": signal.subcategory, "weight": signal.weight}
+
+
+@app.get("/personalization/profile")
+def get_personalization_profile(session: Session = Depends(get_session)):
+    """현재까지 쌓인 개인화 프로필 전체 (시간 가중 감쇠 적용된 상태)."""
+    return {"profile": get_profile(session)}
+
+
+@app.get("/personalization/top-interests")
+def get_personalization_top_interests(n: int = Query(5), session: Session = Depends(get_session)):
+    """챗봇/보고서 생성 프롬프트에 주입할 상위 관심사."""
+    top = get_top_interests(session, n=n)
+    return {"top_interests": [{"subcategory": s, **d} for s, d in top]}
+
+
 # 1. 동기식 문장 대조 번역 API
 @app.post("/articles/{article_id}/study-translate")
 def study_translate_article(
@@ -601,21 +719,42 @@ async def study_translate_article_stream(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-def _collect_single_keyword(keyword_name: str, session: Session) -> dict:
+def _collect_single_keyword(
+    keyword_name: str,
+    session: Session,
+    months_back: int = 1,
+    interval_hours: float = 24.0,
+) -> dict:
     """
     검색창에 입력된 키워드 하나만 즉시 강제 수집한다 (due 체크 무시, 다른
     소스/키워드는 절대 건드리지 않는다). "파이프라인 수집" 버튼에 검색어가
     들어있을 때 이 함수가 호출된다.
+
+    아직 등록되지 않은 키워드면 여기서 자동으로 등록한 뒤 바로 수집한다
+    ("검색/등록"을 따로 먼저 눌러야만 하는 불편함을 없애기 위함 - 8/7 세션에서
+    사용자 피드백으로 반영됨). months_back/interval_hours는 검색창 옆
+    수집 옵션(⚙)에서 설정한 값을 그대로 받아 신규 등록 시 적용한다.
     """
     keyword = session.exec(select(Keyword).where(Keyword.name == keyword_name)).first()
+    auto_registered = False
     if not keyword:
-        raise HTTPException(
-            status_code=404,
-            detail=f"'{keyword_name}' 키워드가 아직 등록되지 않았습니다. 먼저 '검색/등록' 버튼으로 등록해주세요."
+        keyword = Keyword(
+            name=keyword_name,
+            months_back=months_back,
+            interval_hours=interval_hours,
         )
+        session.add(keyword)
+        session.commit()
+        session.refresh(keyword)
+        auto_registered = True
+        logger.info(f"[collect] '{keyword_name}' 키워드 자동 등록 (파이프라인 수집에서)")
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
-    job_control.start_job(f"키워드 수집: {keyword.name}")
+    if not job_control.start_job(f"키워드 수집: {keyword.name}"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"다른 수집 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
+        )
     try:
         result = collector.collect_for_keyword(keyword, session)
         keyword.last_collected_at = datetime.now()
@@ -629,6 +768,12 @@ def _collect_single_keyword(keyword_name: str, session: Session) -> dict:
     finally:
         job_control.finish_job()
 
+    message = (
+        f"✨ '{keyword_name}' 키워드를 새로 등록하고 즉시 수집했습니다! (신규 {new_count}건)"
+        if auto_registered
+        else f"'{keyword_name}' 키워드만 수집 완료! (신규 {new_count}건)"
+    )
+
     return {
         "status": "success",
         "total_count": new_count,
@@ -638,18 +783,20 @@ def _collect_single_keyword(keyword_name: str, session: Session) -> dict:
             "keywords_checked": 1,
             "keywords_new_articles": new_count,
         },
-        "message": f"'{keyword_name}' 키워드만 수집 완료! (신규 {new_count}건)"
+        "message": message
     }
 
 
-# 3. 수집 실행 API - keyword 파라미터가 있으면 그 키워드만, 없으면 전체 소스/키워드 점검
+# 3. 수집 실행 API - keyword 파라미터가 있으면 그 키워드만(없으면 자동 등록), 없으면 전체 소스/키워드 점검
 @app.get("/collect/deep-incremental")
 def collect_deep_incremental(
     keyword: str | None = Query(None),
+    months_back: int = Query(1),
+    interval_hours: float = Query(24.0),
     session: Session = Depends(get_session),
 ):
     if keyword and keyword.strip():
-        return _collect_single_keyword(keyword.strip(), session)
+        return _collect_single_keyword(keyword.strip(), session, months_back, interval_hours)
 
     stats = scheduler_module.run_tick()
     total = stats["sources_new_articles"] + stats["keywords_new_articles"]
@@ -685,7 +832,17 @@ def create_keyword(request: KeywordCreateRequest, session: Session = Depends(get
     session.refresh(keyword)
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
-    job_control.start_job(f"키워드 등록: {keyword.name}")
+    if not job_control.start_job(f"키워드 등록: {keyword.name}"):
+        logger.warning(f"키워드 등록 즉시수집 스킵 - 다른 작업 진행 중 (현재: {job_control.current_job()})")
+        return {
+            "status": "success",
+            "keyword": keyword.name,
+            "new_articles": 0,
+            "message": (
+                f"'{keyword.name}' 키워드가 등록됐지만, 다른 수집 작업이 진행 중이라 "
+                f"즉시 수집은 건너뛰었습니다. 잠시 후 '검색/등록'을 다시 눌러 재수집해주세요."
+            )
+        }
     try:
         result = collector.collect_for_keyword(keyword, session)
         keyword.last_collected_at = datetime.now()
@@ -715,7 +872,11 @@ def recollect_keyword(keyword_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="해당 키워드를 찾을 수 없습니다.")
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
-    job_control.start_job(f"키워드 재수집: {keyword.name}")
+    if not job_control.start_job(f"키워드 재수집: {keyword.name}"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"다른 수집 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
+        )
     try:
         result = collector.collect_for_keyword(keyword, session)
         keyword.last_collected_at = datetime.now()
@@ -755,22 +916,100 @@ def update_keyword(keyword_id: int, request: KeywordUpdateRequest, session: Sess
     }
 
 
-# 3-2. 키워드 목록 조회
+# 3-1-3. '검색주기설정' 버튼 전용 - 키워드가 없으면 등록, 있으면 개월수/주기 갱신.
+# '실시간 수집' 버튼이 즉시 수집을 전담하므로, 여기서는 절대 크롤링을 트리거하지 않는다
+# (8/7 세션 후반 - 두 버튼의 역할을 "지금 당장 수집" vs "설정만 정하기"로 명확히 분리).
+# 이미 등록된 키워드에 대해 버튼을 다시 눌러도(재클릭) months_back/interval_hours를
+# 그대로 덮어써 수정할 수 있다 (upsert 방식).
+@app.put("/keywords/interval")
+def set_keyword_interval(request: KeywordIntervalSetRequest, session: Session = Depends(get_session)):
+    if request.interval_hours <= 0:
+        raise HTTPException(status_code=400, detail="interval_hours는 0보다 커야 합니다.")
+    if request.months_back <= 0:
+        raise HTTPException(status_code=400, detail="months_back은 0보다 커야 합니다.")
+
+    keyword = session.exec(select(Keyword).where(Keyword.name == request.name)).first()
+    if keyword:
+        keyword.months_back = request.months_back
+        keyword.interval_hours = request.interval_hours
+        session.add(keyword)
+        session.commit()
+        return {
+            "status": "success",
+            "message": (
+                f"'{request.name}' 키워드 설정을 변경했습니다 "
+                f"(최근 {request.months_back}개월 이내 자료, {request.interval_hours}시간마다 재수집)."
+            )
+        }
+
+    keyword = Keyword(name=request.name, months_back=request.months_back, interval_hours=request.interval_hours)
+    session.add(keyword)
+    session.commit()
+    return {
+        "status": "success",
+        "message": (
+            f"'{request.name}' 키워드를 등록했습니다 "
+            f"(최근 {request.months_back}개월 이내 자료, {request.interval_hours}시간마다 재수집)."
+        )
+    }
+
+
+# 3-1-4. 키워드 삭제 - 등록 취소와 함께, 그 키워드로 수집된 기사도 전부 함께 삭제한다
+# (8/7 세션 후반 요청 반영 - 이전엔 기사를 남겼으나 이제는 완전 삭제로 변경).
+@app.delete("/keywords/{keyword_id}")
+def delete_keyword(keyword_id: int, session: Session = Depends(get_session)):
+    keyword = session.get(Keyword, keyword_id)
+    if not keyword:
+        raise HTTPException(status_code=404, detail="해당 키워드를 찾을 수 없습니다.")
+
+    name = keyword.name
+
+    articles_to_delete = session.exec(select(Article).where(Article.keyword == name)).all()
+    deleted_count = len(articles_to_delete)
+    for article in articles_to_delete:
+        session.delete(article)
+
+    session.delete(keyword)
+    session.commit()
+    return {
+        "status": "success",
+        "message": f"'{name}' 키워드와 수집된 기사 {deleted_count}건을 함께 삭제했습니다."
+    }
+
+
+# 3-2. 키워드 목록 조회 - 키워드 관리 패널(전체 보기)에서 쓸 통계(건수/게시일 범위) 포함
 @app.get("/keywords")
 def list_keywords(session: Session = Depends(get_session)):
     keywords = session.exec(select(Keyword)).all()
-    return {
-        "keywords": [
-            {
-                "id": k.id,
-                "name": k.name,
-                "months_back": k.months_back,
-                "interval_hours": k.interval_hours,
-                "last_collected_at": k.last_collected_at.isoformat() if k.last_collected_at else None,
-            }
-            for k in keywords
-        ]
-    }
+    result = []
+
+    for k in keywords:
+        articles = session.exec(select(Article).where(Article.keyword == k.name)).all()
+
+        # published_at은 RSS 원문의 pubDate 문자열을 그대로 저장한 것(RFC822 형식이 대부분).
+        # 파싱 실패하는 건(형식이 다른 소수 케이스)은 날짜 범위 계산에서 조용히 제외한다 -
+        # 목적이 "대략 언제부터 언제까지 모았는지" 보여주는 것이라 일부 누락은 괜찮음.
+        parsed_dates = []
+        for a in articles:
+            if not a.published_at:
+                continue
+            try:
+                parsed_dates.append(parsedate_to_datetime(a.published_at))
+            except Exception:
+                continue
+
+        result.append({
+            "id": k.id,
+            "name": k.name,
+            "months_back": k.months_back,
+            "interval_hours": k.interval_hours,
+            "last_collected_at": k.last_collected_at.isoformat() if k.last_collected_at else None,
+            "article_count": len(articles),
+            "earliest_published_at": min(parsed_dates).isoformat() if parsed_dates else None,
+            "latest_published_at": max(parsed_dates).isoformat() if parsed_dates else None,
+        })
+
+    return {"keywords": result}
 
 
 # 3-3. 소스 목록 조회 (관리 패널용)

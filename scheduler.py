@@ -28,7 +28,9 @@ import activity_tracker
 logger = logging.getLogger(__name__)
 
 FAIL_THRESHOLD = 3      # 연속 실패 임계값 - 넘으면 status=FAILING (삭제는 사용자 판단)
-PROMOTE_THRESHOLD = 3   # CandidateSource.hit_count 임계값 - 넘으면 Source로 자동 승격
+PROMOTE_THRESHOLD = 1   # CandidateSource.hit_count 임계값 - 1이면 "첫 등장 즉시 승격".
+                         # 이전엔 3이라 1~2회만 등장한 출처가 출처관리에 안 보이는
+                         # 문제가 있었음 (기사는 저장되지만 Source 테이블엔 미등록).
 
 
 def seed_manual_sources(target_sources: list[dict]):
@@ -85,8 +87,17 @@ def run_tick() -> dict:
     스케줄러의 매 틱마다 호출된다. Source와 Keyword를 각각 점검하고 결과를
     요약해서 반환한다. job_control로 감싸서, 사용자가 "파이프라인 수집" 버튼을
     재클릭했을 때(/collect/cancel) 이 틱이 실행 중이었다면 실제로 중단된다.
+
+    이미 다른 작업(예: 사용자가 검색창에서 특정 키워드를 단독 수집 중)이
+    진행 중이면 이번 틱은 건너뛴다 - 8/7 세션에서 두 작업이 같은 키워드를
+    동시에 쓰려다 SQLite "database is locked"가 난 문제의 재발 방지.
     """
-    job_control.start_job("파이프라인 점검")
+    if not job_control.start_job("파이프라인 점검"):
+        logger.info(f"[scheduler] 다른 작업이 진행 중이라 이번 틱은 건너뜀 (현재: {job_control.current_job()})")
+        return {
+            "sources_checked": 0, "sources_new_articles": 0,
+            "keywords_checked": 0, "keywords_new_articles": 0,
+        }
     try:
         logger.info("[scheduler] tick 시작")
         source_stats = _tick_sources()
@@ -183,6 +194,11 @@ def _track_candidates(session: Session, keyword: Keyword, discovered: list[tuple
     """
     이번 수집에서 발견된 출처(도메인)별로 CandidateSource.hit_count를 올리고,
     임계값(PROMOTE_THRESHOLD)을 넘으면 Source 테이블로 자동 승격한다.
+
+    PROMOTE_THRESHOLD=1인 지금은 "새로 생긴 후보(hit_count=1)"도 곧바로 승격
+    대상이므로, 신규 생성 분기에서도 승격 검사를 반드시 거쳐야 한다 (예전엔
+    신규 생성 시 무조건 continue라서, 임계값을 1로 낮춰도 첫 등장 건은 승격이
+    안 되는 버그가 있었음).
     """
     seen_this_run = set()
 
@@ -199,27 +215,29 @@ def _track_candidates(session: Session, keyword: Keyword, discovered: list[tuple
         ).first()
 
         if candidate is None:
-            session.add(CandidateSource(
+            candidate = CandidateSource(
                 keyword_id=keyword.id,
                 domain=domain,
                 source_name=source_name,
                 hit_count=1,
-            ))
+            )
+            session.add(candidate)
             session.commit()
-            continue
+            session.refresh(candidate)
+        else:
+            if candidate.status != CandidateStatus.CANDIDATE:
+                continue  # 이미 승격됐거나 사용자가 제외 처리한 후보는 더 안 올림
+            candidate.hit_count += 1
+            candidate.updated_at = datetime.now()
+            session.add(candidate)
+            session.commit()
+            session.refresh(candidate)
 
-        if candidate.status != CandidateStatus.CANDIDATE:
-            continue  # 이미 승격됐거나 사용자가 제외 처리한 후보는 더 안 올림
-
-        candidate.hit_count += 1
-        candidate.updated_at = datetime.now()
-
-        if candidate.hit_count >= PROMOTE_THRESHOLD:
+        if candidate.status == CandidateStatus.CANDIDATE and candidate.hit_count >= PROMOTE_THRESHOLD:
             candidate.status = CandidateStatus.PROMOTED
             _promote_candidate(session, keyword, candidate)
-
-        session.add(candidate)
-        session.commit()
+            session.add(candidate)
+            session.commit()
 
 
 def _promote_candidate(session: Session, keyword: Keyword, candidate: CandidateSource):

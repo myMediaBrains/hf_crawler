@@ -1,5 +1,6 @@
 # database.py
 from sqlmodel import SQLModel, create_engine, Session
+from sqlalchemy import event
 from typing import Generator
 import os
 
@@ -8,11 +9,37 @@ DB_NAME = os.getenv("DB_NAME", "local_deep_trend.db")
 DATABASE_URL = f"sqlite:///./{DB_NAME}"
 
 # SQLAlchemy 엔진 생성 (check_same_thread=False는 SQLite에서 필수)
+# timeout=30: 다른 커넥션이 쓰기 락을 쥐고 있을 때 sqlite3 드라이버가 즉시
+# "database is locked"를 던지지 않고 최대 30초까지 재시도하며 기다리게 한다.
+# 이것만으로는 완전하지 않아서, 아래 PRAGMA로 WAL 모드도 함께 켠다.
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
     echo=False  # True로 설정하면 SQL 로그 확인 가능
 )
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    """
+    커넥션이 열릴 때마다 SQLite 동시성 관련 PRAGMA를 적용한다.
+
+    - journal_mode=WAL: 기본(rollback journal) 모드는 쓰기 중엔 읽기까지 막히는데,
+      이 앱은 크롤링(쓰기)과 프론트엔드 폴링(/stats/system 등, 읽기)이 동시에
+      계속 일어나는 구조라 WAL(Write-Ahead Logging)로 바꿔야 읽기가 쓰기를
+      막지 않는다. 여러 프로세스/스레드가 있어도 파일 기반으로 안전하게 동작.
+    - busy_timeout=30000(ms): 쓰기 락이 걸려 있을 때 즉시 실패하지 않고 최대
+      30초간 재시도. 8/7 세션에서 같은 키워드를 두 작업이 동시에 수집하면서
+      "database is locked" 에러가 발생한 문제의 근본 완화책.
+    - synchronous=NORMAL: WAL 모드에서 권장되는 설정, FULL보다 약간 빠르면서도
+      충분히 안전함 (SQLite 공식 문서 권장값).
+    """
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
 
 def create_db_and_tables():
     """데이터베이스 테이블 생성"""

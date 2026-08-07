@@ -26,6 +26,7 @@ from sqlmodel import Session, select
 
 from models import Article, Source, Keyword, ContentOrigin
 from content_utils import clean_article_content, crawl_url_sync, is_crawl_failure
+from personalization import classify_and_store
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,14 @@ class RSSCollector(BaseCollector):
                 origin=ContentOrigin.RAW_CRAWL,
             )
             session.add(article)
+            session.flush()  # commit 전에 article.id를 확보하기 위한 flush
+            # 고정 RSS 수집 = 사용자가 직접 요청한 게 아니라 백그라운드에서
+            # 자동으로 들어온 기사이므로 약한 암묵적 신호(weight=0.3)로 기록한다.
+            classify_and_store(
+                session, article.title, article.content or "",
+                source="extension", signal_type="implicit", weight=0.3,
+                article_id=article.id,
+            )
             new_count += 1
 
         session.commit()
@@ -166,11 +175,20 @@ class GoogleNewsSearchCollector(BaseCollector):
                 continue
 
             domain, extracted_name = self._extract_source(entry, title)
-            source_name = fixed_source_name or extracted_name
+            if fixed_source_name:
+                source_name = fixed_source_name
+            elif keyword_name:
+                # 나중에 이 도메인이 승격되면 Source.name이 "[키워드] 표시이름"
+                # 형식이 되므로(scheduler.py _promote_candidate), 승격 전
+                # 키워드 광역 검색으로 저장하는 기사도 처음부터 같은 형식으로
+                # 맞춰야 건수 집계(/stats/sources)가 어긋나지 않는다.
+                source_name = f"[{keyword_name}] {extracted_name}"
+            else:
+                source_name = extracted_name
 
             if track_domains:
                 discovered.append((domain, extracted_name))
-
+                
             # Google 뉴스 RSS의 link는 news.google.com/rss/articles/... 리다이렉트
             # 래퍼 URL이라, 이 상태로 그대로 크롤링하면 실제 기사 대신 구글 자체
             # 안내/동의 화면만 잡혀서 is_crawl_failure()에 전부 걸러진다. googlenewsdecoder로
@@ -199,6 +217,14 @@ class GoogleNewsSearchCollector(BaseCollector):
                 origin=ContentOrigin.RAW_CRAWL,
             )
             session.add(article)
+            session.flush()  # commit 전에 article.id를 확보하기 위한 flush
+            # 키워드 검색 수집 = 사용자가 검색창에 직접 입력한 키워드에서 나온 결과이므로
+            # RSS 고정 수집보다 더 강한 신호로 취급한다(weight=0.5, signal_type="explicit").
+            classify_and_store(
+                session, article.title, article.content or "",
+                source="extension", signal_type="explicit", weight=0.5,
+                article_id=article.id,
+            )
             new_count += 1
 
         session.commit()
