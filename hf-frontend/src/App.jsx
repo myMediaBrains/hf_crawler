@@ -97,6 +97,19 @@ function App() {
     const [newSource, setNewSource] = useState({ name: '', url: '', category: '', interval_hours: 3 });
     const [tickMinutes, setTickMinutes] = useState(30);
 
+    // 재클릭 시 진행 중인 작업을 중단하기 위한 개별 상태/컨트롤러.
+    // 예전엔 loading 하나를 모든 버튼이 공유해서, 하나가 실행 중이면 나머지
+    // 버튼까지 전부 disabled로 잠겨 "눌러도 반응이 없는" 것처럼 보였다.
+    // 이제 액션별로 독립된 pending 상태를 쓰고, 오래 걸리는 두 액션(파이프라인
+    // 수집/검색·등록)은 AbortController + 백엔드 /collect/cancel로 실제 중단도 지원한다.
+    const pipelineControllerRef = useRef(null);
+    const [pipelinePending, setPipelinePending] = useState(false);
+
+    const searchControllerRef = useRef(null);
+    const [searchPending, setSearchPending] = useState(false);
+
+    const [sourceStatsPending, setSourceStatsPending] = useState(false);
+
     // 개인저장방(Vault)
     const [vaultFolders, setVaultFolders] = useState([]);
 
@@ -228,12 +241,19 @@ function App() {
         fetchKeywordStats();
         fetchSystemStats();
 
-        const interval = setInterval(() => {
+        const statsInterval = setInterval(() => {
             fetchSystemStats();
         }, POLLING_INTERVAL);
 
+        // 키워드별 현황은 초 단위로 자주 바뀔 필요는 없으니 조금 더 긴 주기로 폴링
+        // (너무 짧으면 백엔드에 불필요한 부하)
+        const keywordStatsInterval = setInterval(() => {
+            fetchKeywordStats();
+        }, POLLING_INTERVAL * 5);
+
         return () => {
-            clearInterval(interval);
+            clearInterval(statsInterval);
+            clearInterval(keywordStatsInterval);
             Object.values(eventSourceRef.current).forEach(es => {
                 if (es) es.close();
             });
@@ -244,30 +264,65 @@ function App() {
     // 이벤트 핸들러
     // ============================================
     const handleCollectPipeline = async () => {
-        const toastId = toast.loading('파이프라인 수집 중...');
-        setLoading(true);
-        setMessage('파이프라인 가동 중: 등록된 소스와 키워드를 점검하고 있습니다...');
-        
+        // 이미 진행 중이면: 재클릭은 "중단"으로 동작한다.
+        if (pipelineControllerRef.current) {
+            pipelineControllerRef.current.abort();
+            pipelineControllerRef.current = null;
+            try { await axios.post(`${API_URL}/collect/cancel`); } catch (_) { /* 취소 요청 실패는 무시 */ }
+            setPipelinePending(false);
+            toast.dismiss();
+            toast('파이프라인 수집을 중단했습니다.');
+            return;
+        }
+
+        const targetKeyword = keyword.trim();
+        const controller = new AbortController();
+        pipelineControllerRef.current = controller;
+        setPipelinePending(true);
+
+        const toastId = toast.loading(
+            targetKeyword ? `'${targetKeyword}' 키워드 수집 중... (다시 누르면 중단)` : '파이프라인 수집 중... (다시 누르면 중단)'
+        );
+        setMessage(
+            targetKeyword
+                ? `'${targetKeyword}' 키워드만 점검하고 있습니다...`
+                : '파이프라인 가동 중: 등록된 소스와 키워드를 점검하고 있습니다...'
+        );
+
         try {
-            const response = await axios.get(`${API_URL}/collect/deep-incremental`);
+            const url = targetKeyword
+                ? `${API_URL}/collect/deep-incremental?keyword=${encodeURIComponent(targetKeyword)}`
+                : `${API_URL}/collect/deep-incremental`;
+
+            const response = await axios.get(url, { signal: controller.signal });
             const detail = response.data.detail || {};
 
-            const detailMsg = 
-                `✨ 파이프라인 수집 완료! (총 신규: ${response.data.total_count}건)\n` +
+            const detailMsg = targetKeyword
+                ? `✨ '${targetKeyword}' 키워드 수집 완료! (신규 ${response.data.total_count}건)`
+                : `✨ 파이프라인 수집 완료! (총 신규: ${response.data.total_count}건)\n` +
                 `• 고정 소스: ${detail.sources_checked ?? 0}건 점검 (신규 ${detail.sources_new_articles ?? 0}건)\n` +
                 `• 키워드: ${detail.keywords_checked ?? 0}건 점검 (신규 ${detail.keywords_new_articles ?? 0}건)`;
-            
+
             setMessage(detailMsg);
             toast.success(`수집 완료! ${response.data.total_count}건 추가됨`, { id: toastId });
             await fetchArticles(keyword);
             await fetchKeywordStats();
             await fetchSystemStats();
         } catch (err) {
-            console.error("파이프라인 수집 에러:", err);
-            setMessage('파이프라인 수집 중 에러가 발생했습니다.');
-            toast.error('수집 중 오류가 발생했습니다.', { id: toastId });
+            if (axios.isCancel(err) || err.code === 'ERR_CANCELED') {
+                return; // 위에서 이미 중단 안내 토스트를 띄웠음
+            }
+            if (err.response?.status === 404) {
+                toast.error(err.response.data?.detail || '등록되지 않은 키워드입니다.', { id: toastId });
+                setMessage(err.response.data?.detail || '등록되지 않은 키워드입니다.');
+            } else {
+                console.error("파이프라인 수집 에러:", err);
+                setMessage('파이프라인 수집 중 에러가 발생했습니다.');
+                toast.error('수집 중 오류가 발생했습니다.', { id: toastId });
+            }
         } finally {
-            setLoading(false);
+            pipelineControllerRef.current = null;
+            setPipelinePending(false);
         }
     };
 
@@ -277,7 +332,7 @@ function App() {
             return;
         }
 
-        setLoading(true);
+        setSourceStatsPending(true);
         try {
             const response = await axios.get(`${API_URL}/stats/sources`);
             const total = response.data.total_articles;
@@ -290,7 +345,7 @@ function App() {
             setMessage('출처별 통계를 조회하는 중 에러가 발생했습니다.');
             toast.error('통계 조회 실패');
         } finally {
-            setLoading(false);
+            setSourceStatsPending(false);
         }
     };
 
@@ -497,29 +552,70 @@ function App() {
             return;
         }
 
-        setLoading(true);
-        const toastId = toast.loading(`'${keyword}' 키워드 확인 중...`);
+        // 이미 진행 중이면: 재클릭은 "중단"으로 동작한다.
+        if (searchControllerRef.current) {
+            searchControllerRef.current.abort();
+            searchControllerRef.current = null;
+            try { await axios.post(`${API_URL}/collect/cancel`); } catch (_) { /* 무시 */ }
+            setSearchPending(false);
+            toast.dismiss();
+            toast('검색/등록을 중단했습니다.');
+            return;
+        }
+
+        const controller = new AbortController();
+        searchControllerRef.current = controller;
+        setSearchPending(true);
+        const toastId = toast.loading(`'${keyword}' 키워드 확인 중... (다시 누르면 중단)`);
 
         try {
             const response = await axios.post(`${API_URL}/keywords`, {
                 name: keyword.trim(),
                 months_back: monthsBack,
                 interval_hours: intervalHours,
-            });
+            }, { signal: controller.signal });
             toast.success(response.data.message, { id: toastId });
+            await fetchArticles(keyword);
+            await fetchKeywordStats();
         } catch (err) {
+            if (axios.isCancel(err) || err.code === 'ERR_CANCELED') {
+                return; // 위에서 이미 중단 안내 토스트를 띄웠음
+            }
             if (err.response?.status === 400) {
-                // 이미 등록된 키워드 - 정상 흐름이므로 조용히 넘어감
-                toast.dismiss(toastId);
+                // 이미 등록된 키워드 - 그냥 무시하지 않고 강제 재수집을 시도한다.
+                try {
+                    const listRes = await axios.get(`${API_URL}/keywords`);
+                    const existing = (listRes.data.keywords || []).find(
+                        (k) => k.name === keyword.trim()
+                    );
+                    if (existing) {
+                        toast.loading(`'${keyword}' 재수집 중... (다시 누르면 중단)`, { id: toastId });
+                        const recollectRes = await axios.post(
+                            `${API_URL}/keywords/${existing.id}/recollect`,
+                            {},
+                            { signal: controller.signal }
+                        );
+                        toast.success(recollectRes.data.message, { id: toastId });
+                        await fetchArticles(keyword);
+                        await fetchKeywordStats();
+                    } else {
+                        toast.dismiss(toastId);
+                    }
+                } catch (recollectErr) {
+                    if (axios.isCancel(recollectErr) || recollectErr.code === 'ERR_CANCELED') {
+                        return;
+                    }
+                    console.error("재수집 에러:", recollectErr);
+                    toast.error('재수집 중 오류가 발생했습니다.', { id: toastId });
+                }
             } else {
                 console.error("키워드 등록 에러:", err);
                 toast.error('키워드 등록 중 오류가 발생했습니다.', { id: toastId });
             }
+        } finally {
+            searchControllerRef.current = null;
+            setSearchPending(false);
         }
-
-        await fetchArticles(keyword);
-        await fetchKeywordStats();
-        setLoading(false);
     };
 
     const handleStatClick = async (targetKw) => {
@@ -583,12 +679,42 @@ function App() {
     const handleUpdateTickMinutes = async () => {
         const toastId = toast.loading('스케줄러 간격 변경 중...');
         try {
-            await axios.put(`${API_URL}/scheduler/config`, { tick_minutes: tickMinutes });
-            toast.success('변경 완료!', { id: toastId });
+            const res = await axios.put(`${API_URL}/scheduler/config`, { tick_minutes: tickMinutes });
+            if (res.data.warning) {
+                // 가장 짧은 소스/키워드 주기보다 스케줄러 점검 간격이 더 길면,
+                // 그 항목은 설정한 주기대로 안 돌기 때문에 경고를 보여준다.
+                toast(res.data.warning, { id: toastId, icon: '⚠️', duration: 7000 });
+            } else {
+                toast.success('변경 완료!', { id: toastId });
+            }
         } catch (err) {
             console.error("스케줄러 설정 변경 에러:", err);
             toast.error('변경 실패', { id: toastId });
         }
+    };
+
+    // 소스 하나의 점검 주기(시간)를 변경한다. 소스관리 패널의 각 행에서 인라인으로 편집.
+    const handleUpdateSourceInterval = async (sourceId, newHours) => {
+        if (!(newHours > 0)) return;
+        try {
+            const res = await axios.patch(`${API_URL}/sources/${sourceId}`, { interval_hours: newHours });
+            toast.success(res.data.message);
+            await fetchSources();
+        } catch (err) {
+            console.error("소스 주기 변경 에러:", err);
+            toast.error('주기 변경 실패');
+        }
+    };
+
+    // 마지막 점검 시각 + 점검 주기(시간)로 "다음 점검까지"를 계산해서 보여준다.
+    // 스케줄러 점검 간격(tick_minutes)/소스 주기/키워드 주기가 실제로 어떻게
+    // 맞물려 도는지 화면에서 바로 체감할 수 있게 하기 위함.
+    const formatNextCheck = (lastAt, hours) => {
+        if (!lastAt) return '대기 중 (다음 틱에 점검)';
+        const next = new Date(new Date(lastAt).getTime() + hours * 3600 * 1000);
+        const diffMin = Math.round((next - new Date()) / 60000);
+        if (diffMin <= 0) return '대기 중 (다음 틱에 점검)';
+        return diffMin < 60 ? `${diffMin}분 후` : `${(diffMin / 60).toFixed(1)}시간 후`;
     };
 
     const handleExportToVault = async (articleId, folder, filename, content) => {
@@ -837,10 +963,9 @@ function App() {
                 <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
                     <button 
                         className="collect-btn" 
-                        onClick={handleCollectPipeline} 
-                        disabled={loading}
+                        onClick={handleCollectPipeline}
                     >
-                        {loading ? '⏳ 처리 중...' : '⚡ 파이프라인 수집'}
+                        {pipelinePending ? '⏹ 중단 (클릭)' : '⚡ 파이프라인 수집'}
                     </button>
 
                     <form onSubmit={handleSearch} className="search-form">
@@ -850,11 +975,10 @@ function App() {
                             value={keyword} 
                             onChange={(e) => setKeyword(e.target.value)}
                             onKeyDown={handleKeyDown}
-                            disabled={loading}
                         />
                         <div className="search-btn-group">
-                            <button type="submit" className="search-btn" disabled={loading}>
-                                🔍 검색/등록
+                            <button type="submit" className="search-btn">
+                                {searchPending ? '⏹ 중단 (클릭)' : '🔍 검색/등록'}
                             </button>
                             <button
                                 type="button"
@@ -896,10 +1020,9 @@ function App() {
                     <button 
                         className="collect-btn" 
                         style={{ backgroundColor: showSourceStats ? '#0284c7' : '#0ea5e9' }}
-                        onClick={handleToggleSourceStats} 
-                        disabled={loading}
+                        onClick={handleToggleSourceStats}
                     >
-                        {loading ? '⏳ 조회 중...' : (showSourceStats ? '📂 출처 닫기' : '📂 출처 보기')}
+                        {sourceStatsPending ? '⏳ 조회 중...' : (showSourceStats ? '📂 출처 닫기' : '📂 출처 보기')}
                     </button>
 
                     <button 
@@ -915,7 +1038,6 @@ function App() {
                         className="collect-btn"
                         style={{ backgroundColor: showSourceManager ? '#7c3aed' : '#8b5cf6' }}
                         onClick={handleToggleSourceManager}
-                        disabled={loading}
                     >
                         ⚙️ 소스 관리
                     </button>
@@ -930,10 +1052,25 @@ function App() {
                 </div>
             )}
 
+            {showSourceStats && (
+                <div className="source-stats-panel">
+                    <h3>📂 출처별 저장 현황 (총 {sourceStatsData.total}건)</h3>
+                    <div>
+                        {Object.entries(sourceStatsData.counts).map(([name, count]) => (
+                            <div key={name}>
+                                {name}: <strong>{count}건</strong>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
             {showSourceManager && (
                 <div className="source-manager-panel">
                     <div className="scheduler-config-row">
-                        <span>스케줄러 점검 간격:</span>
+                        <span title="이 값은 '몇 시에 시계를 볼지'이고, 아래 각 소스/키워드의 주기(시간)는 '실제로 얼마 만에 한 번씩 도는지'입니다. 스케줄러 점검 간격이 가장 짧은 주기보다 크면 그 항목은 정시에 안 돕니다.">
+                            스케줄러 점검 간격 (ⓘ 소스/키워드별 주기보다 짧아야 함):
+                        </span>
                         <input
                             type="number"
                             min="1"
@@ -983,7 +1120,22 @@ function App() {
                                     {src.status === 'failing' && (
                                         <span className="source-row-warning">⚠️ 탈락 후보 (연속 {src.fail_count}회 실패)</span>
                                     )}
-                                    <span className="source-row-interval">{src.interval_hours}시간 주기</span>
+                                    <span className="source-row-interval">
+                                        <input
+                                            type="number"
+                                            min="0.5"
+                                            step="0.5"
+                                            defaultValue={src.interval_hours}
+                                            style={{ width: '50px' }}
+                                            onBlur={(e) => {
+                                                const v = Number(e.target.value);
+                                                if (v > 0 && v !== src.interval_hours) {
+                                                    handleUpdateSourceInterval(src.id, v);
+                                                }
+                                            }}
+                                        />
+                                        시간 주기 · 다음 점검: {formatNextCheck(src.last_attempt_at, src.interval_hours)}
+                                    </span>
                                     <button onClick={() => handleDeleteSource(src.id)} className="source-row-delete">🗑️</button>
                                 </div>
                             ))

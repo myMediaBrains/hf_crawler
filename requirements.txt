@@ -10,3 +10,4 @@ python-dotenv==1.2.2
 Requests==2.34.2
 sqlmodel==0.0.39
 uvicorn==0.52.1
+googlenewsdecoder>=0.1.7

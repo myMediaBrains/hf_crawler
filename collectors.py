@@ -16,6 +16,10 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, quote
 
+import job_control  # 파일 상단에 추가
+
+from googlenewsdecoder import gnewsdecoder
+
 import requests
 import feedparser
 from sqlmodel import Session, select
@@ -150,6 +154,10 @@ class GoogleNewsSearchCollector(BaseCollector):
         feed = feedparser.parse(response.content)
 
         for entry in feed.entries[:20]:
+            if job_control.is_cancelled():
+                logger.info("[GoogleNewsSearchCollector] 사용자 요청으로 수집 중단")
+                break
+
             title = entry.get("title", "No Title")
             link = entry.get("link", "")
             published = entry.get("published", entry.get("updated", str(datetime.now())))
@@ -165,9 +173,8 @@ class GoogleNewsSearchCollector(BaseCollector):
 
             # Google 뉴스 RSS의 link는 news.google.com/rss/articles/... 리다이렉트
             # 래퍼 URL이라, 이 상태로 그대로 크롤링하면 실제 기사 대신 구글 자체
-            # 안내/동의 화면만 잡혀서 is_crawl_failure()에 전부 걸러진다. 표준 HTTP
-            # 리다이렉트를 미리 따라가서 진짜 발행사 URL로 풀어낸 뒤 그 주소로
-            # 크롤링/중복확인/저장을 한다.
+            # 안내/동의 화면만 잡혀서 is_crawl_failure()에 전부 걸러진다. googlenewsdecoder로
+            # 실제 발행사 URL로 풀어낸 뒤 그 주소로 크롤링/중복확인/저장을 한다.
             resolved_link = self._resolve_real_url(link)
 
             existing = session.exec(select(Article).where(Article.url == resolved_link)).first()
@@ -200,21 +207,24 @@ class GoogleNewsSearchCollector(BaseCollector):
     @staticmethod
     def _resolve_real_url(google_news_link: str) -> str:
         """
-        news.google.com/rss/articles/... 래퍼 URL을 표준 HTTP 리다이렉트로 따라가서
-        실제 발행사 기사 URL로 풀어낸다. 리다이렉트가 안 되거나 여전히
-        news.google.com에 머물면(구글이 JS 기반 동의 화면을 띄우는 경우 등),
-        원래 링크를 그대로 반환한다 - 이후 크롤링 단계에서 is_crawl_failure()가
-        걸러줄 것이다.
+        news.google.com/rss/articles/... 래퍼 URL을 실제 발행사 URL로 풀어낸다.
+        구글이 표준 HTTP 302가 아니라 자체 batchexecute 엔드포인트를 통해서만
+        실제 URL을 내려주기 때문에(단순 리다이렉트 추적으로는 안 풀림 - 8/7 세션에서
+        확인된 사실), googlenewsdecoder 라이브러리로 서명 파라미터를 추출하고
+        구글 내부 API를 호출해서 디코딩한다.
+        실패하면(레이트리밋 429 등) 원래 링크를 그대로 반환 - 이후 크롤링 단계에서
+        is_crawl_failure()가 걸러줄 것이다.
         """
         try:
-            response = requests.get(
-                google_news_link, headers=HEADERS, timeout=8, allow_redirects=True
+            result = gnewsdecoder(google_news_link, interval=1)
+            if result.get("status") and result.get("decoded_url"):
+                return result["decoded_url"]
+            logger.warning(
+                f"[GoogleNewsSearchCollector] URL 디코딩 실패: {result.get('message')} "
+                f"({google_news_link})"
             )
-            final_url = response.url
-            if final_url and "news.google.com" not in urlparse(final_url).netloc:
-                return final_url
-        except requests.RequestException as e:
-            logger.warning(f"[GoogleNewsSearchCollector] 리다이렉트 해석 실패, 원래 링크 사용: {google_news_link} ({e})")
+        except Exception as e:
+            logger.warning(f"[GoogleNewsSearchCollector] URL 디코딩 중 예외: {google_news_link} ({e})")
         return google_news_link
 
     @staticmethod

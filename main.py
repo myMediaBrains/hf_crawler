@@ -32,6 +32,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlmodel import Session, select, func as sql_func, or_
 
+import job_control  # 파일 상단에 추가
+
 # 환경 변수 로드
 load_dotenv()
 
@@ -156,6 +158,14 @@ class SourceCreateRequest(BaseModel):
     category: str | None = None
     source_type: str = "rss"
     interval_hours: float = 3.0
+
+
+class SourceUpdateRequest(BaseModel):
+    interval_hours: float
+
+
+class KeywordUpdateRequest(BaseModel):
+    interval_hours: float
 
 
 class SchedulerConfigUpdateRequest(BaseModel):
@@ -391,6 +401,13 @@ def _save_translation(article_id: int, mode: str, task: str, translated_content:
     session.add(translation)
     session.commit()
 
+@app.post("/collect/cancel")
+def cancel_collection():
+    name = job_control.cancel_current_job()
+    if name:
+        return {"status": "success", "message": f"'{name}' 작업 중단을 요청했습니다."}
+    return {"status": "success", "message": "현재 실행 중인 수집 작업이 없습니다."}
+
 
 # 1. 동기식 문장 대조 번역 API
 @app.post("/articles/{article_id}/study-translate")
@@ -584,9 +601,56 @@ async def study_translate_article_stream(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-# 3. 수집 실행 API - Source/Keyword 전체를 대상으로 즉시 1회 틱 실행
+def _collect_single_keyword(keyword_name: str, session: Session) -> dict:
+    """
+    검색창에 입력된 키워드 하나만 즉시 강제 수집한다 (due 체크 무시, 다른
+    소스/키워드는 절대 건드리지 않는다). "파이프라인 수집" 버튼에 검색어가
+    들어있을 때 이 함수가 호출된다.
+    """
+    keyword = session.exec(select(Keyword).where(Keyword.name == keyword_name)).first()
+    if not keyword:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{keyword_name}' 키워드가 아직 등록되지 않았습니다. 먼저 '검색/등록' 버튼으로 등록해주세요."
+        )
+
+    collector = COLLECTOR_REGISTRY["google_news_search"]
+    job_control.start_job(f"키워드 수집: {keyword.name}")
+    try:
+        result = collector.collect_for_keyword(keyword, session)
+        keyword.last_collected_at = datetime.now()
+        session.add(keyword)
+        session.commit()
+        scheduler_module._track_candidates(session, keyword, result.discovered_domains)
+        new_count = result.new_count
+    except Exception as e:
+        logger.error(f"키워드 단독 수집 실패 ({keyword_name}): {e}")
+        raise HTTPException(status_code=500, detail=f"수집 중 오류: {e}")
+    finally:
+        job_control.finish_job()
+
+    return {
+        "status": "success",
+        "total_count": new_count,
+        "detail": {
+            "sources_checked": 0,
+            "sources_new_articles": 0,
+            "keywords_checked": 1,
+            "keywords_new_articles": new_count,
+        },
+        "message": f"'{keyword_name}' 키워드만 수집 완료! (신규 {new_count}건)"
+    }
+
+
+# 3. 수집 실행 API - keyword 파라미터가 있으면 그 키워드만, 없으면 전체 소스/키워드 점검
 @app.get("/collect/deep-incremental")
-def collect_deep_incremental():
+def collect_deep_incremental(
+    keyword: str | None = Query(None),
+    session: Session = Depends(get_session),
+):
+    if keyword and keyword.strip():
+        return _collect_single_keyword(keyword.strip(), session)
+
     stats = scheduler_module.run_tick()
     total = stats["sources_new_articles"] + stats["keywords_new_articles"]
 
@@ -601,6 +665,7 @@ def collect_deep_incremental():
             f"(신규 {stats['keywords_new_articles']}건)."
         )
     }
+
 
 
 # 3-1. 키워드 등록 + 즉시 1회 수집
@@ -620,6 +685,7 @@ def create_keyword(request: KeywordCreateRequest, session: Session = Depends(get
     session.refresh(keyword)
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
+    job_control.start_job(f"키워드 등록: {keyword.name}")
     try:
         result = collector.collect_for_keyword(keyword, session)
         keyword.last_collected_at = datetime.now()
@@ -631,12 +697,61 @@ def create_keyword(request: KeywordCreateRequest, session: Session = Depends(get
     except Exception as e:
         logger.error(f"키워드 즉시 수집 실패 ({request.name}): {e}")
         new_count = 0
+    finally:
+        job_control.finish_job()
 
     return {
         "status": "success",
         "keyword": keyword.name,
         "new_articles": new_count,
         "message": f"'{keyword.name}' 키워드 등록 및 즉시 수집 완료 (신규 {new_count}건)."
+    }
+
+# 3-1-1. 이미 등록된 키워드를 강제로 즉시 재수집 (due 체크 무시)
+@app.post("/keywords/{keyword_id}/recollect")
+def recollect_keyword(keyword_id: int, session: Session = Depends(get_session)):
+    keyword = session.get(Keyword, keyword_id)
+    if not keyword:
+        raise HTTPException(status_code=404, detail="해당 키워드를 찾을 수 없습니다.")
+
+    collector = COLLECTOR_REGISTRY["google_news_search"]
+    job_control.start_job(f"키워드 재수집: {keyword.name}")
+    try:
+        result = collector.collect_for_keyword(keyword, session)
+        keyword.last_collected_at = datetime.now()
+        session.add(keyword)
+        session.commit()
+        scheduler_module._track_candidates(session, keyword, result.discovered_domains)
+        new_count = result.new_count
+    except Exception as e:
+        logger.error(f"키워드 강제 재수집 실패 ({keyword.name}): {e}")
+        raise HTTPException(status_code=500, detail=f"재수집 중 오류: {e}")
+    finally:
+        job_control.finish_job()
+
+    return {
+        "status": "success",
+        "keyword": keyword.name,
+        "new_articles": new_count,
+        "message": f"'{keyword.name}' 재수집 완료 (신규 {new_count}건)."
+    }
+
+
+# 3-1-2. 키워드 수집 주기(interval_hours) 변경
+@app.patch("/keywords/{keyword_id}")
+def update_keyword(keyword_id: int, request: KeywordUpdateRequest, session: Session = Depends(get_session)):
+    keyword = session.get(Keyword, keyword_id)
+    if not keyword:
+        raise HTTPException(status_code=404, detail="해당 키워드를 찾을 수 없습니다.")
+    if request.interval_hours <= 0:
+        raise HTTPException(status_code=400, detail="interval_hours는 0보다 커야 합니다.")
+
+    keyword.interval_hours = request.interval_hours
+    session.add(keyword)
+    session.commit()
+    return {
+        "status": "success",
+        "message": f"'{keyword.name}' 수집 주기를 {request.interval_hours}시간으로 변경했습니다."
     }
 
 
@@ -675,6 +790,7 @@ def list_sources(session: Session = Depends(get_session)):
                 "interval_hours": s.interval_hours,
                 "fail_count": s.fail_count,
                 "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
+                "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
             }
             for s in sources
         ]
@@ -700,6 +816,24 @@ def create_source(request: SourceCreateRequest, session: Session = Depends(get_s
     session.commit()
 
     return {"status": "success", "message": f"'{request.name}' 소스가 등록되었습니다."}
+
+
+# 3-4-1. 소스 점검 주기(interval_hours) 변경
+@app.patch("/sources/{source_id}")
+def update_source(source_id: int, request: SourceUpdateRequest, session: Session = Depends(get_session)):
+    source = session.get(Source, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="해당 소스를 찾을 수 없습니다.")
+    if request.interval_hours <= 0:
+        raise HTTPException(status_code=400, detail="interval_hours는 0보다 커야 합니다.")
+
+    source.interval_hours = request.interval_hours
+    session.add(source)
+    session.commit()
+    return {
+        "status": "success",
+        "message": f"'{source.name}' 점검 주기를 {request.interval_hours}시간으로 변경했습니다."
+    }
 
 
 # 3-5. 소스 삭제 (탈락 후보 등 사용자 최종 판단)
@@ -740,7 +874,27 @@ def update_scheduler_config(request: SchedulerConfigUpdateRequest, session: Sess
     scheduler.reschedule_job("tick_scheduler", trigger=IntervalTrigger(minutes=request.tick_minutes))
     logger.info(f"[scheduler] 틱 간격 변경: {request.tick_minutes}분")
 
-    return {"status": "success", "tick_minutes": request.tick_minutes}
+    # 등록된 소스/키워드 중 점검 주기(시간)가 새 tick_minutes보다 촘촘한 게 있으면,
+    # 실제로는 tick_minutes 간격으로만 점검되니 경고를 같이 돌려준다. 이렇게 해야
+    # "스케줄러 점검 간격"과 "소스/키워드별 주기"가 서로 무관하게 따로 노는 게 아니라,
+    # 하나의 정합성 규칙으로 묶여서 보인다.
+    warning = None
+    candidates = [
+        v for v in [
+            session.exec(select(sql_func.min(Source.interval_hours))).first(),
+            session.exec(select(sql_func.min(Keyword.interval_hours))).first(),
+        ] if v is not None
+    ]
+    if candidates:
+        tightest_hours = min(candidates)
+        if request.tick_minutes > tightest_hours * 60:
+            warning = (
+                f"⚠️ 가장 짧은 소스/키워드 점검 주기({tightest_hours}시간)보다 "
+                f"스케줄러 점검 간격({request.tick_minutes}분)이 더 깁니다. "
+                f"이 항목은 설정한 주기가 아니라 {request.tick_minutes}분마다만 점검됩니다."
+            )
+
+    return {"status": "success", "tick_minutes": request.tick_minutes, "warning": warning}
 
 
 # 4. 시스템 통계 API

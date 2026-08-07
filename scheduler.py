@@ -12,6 +12,9 @@ import logging
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
+import job_control  # 파일 상단에 추가
+
+
 from sqlmodel import Session, select
 
 from database import engine
@@ -78,17 +81,25 @@ def _due(last_attempt: datetime | None, interval_hours: float) -> bool:
 
 
 def run_tick() -> dict:
-    """스케줄러의 매 틱마다 호출된다. Source와 Keyword를 각각 점검하고 결과를 요약해서 반환한다."""
-    logger.info("[scheduler] tick 시작")
-    source_stats = _tick_sources()
-    keyword_stats = _tick_keywords()
-    logger.info("[scheduler] tick 완료")
-    return {
-        "sources_checked": source_stats["checked"],
-        "sources_new_articles": source_stats["new_articles"],
-        "keywords_checked": keyword_stats["checked"],
-        "keywords_new_articles": keyword_stats["new_articles"],
-    }
+    """
+    스케줄러의 매 틱마다 호출된다. Source와 Keyword를 각각 점검하고 결과를
+    요약해서 반환한다. job_control로 감싸서, 사용자가 "파이프라인 수집" 버튼을
+    재클릭했을 때(/collect/cancel) 이 틱이 실행 중이었다면 실제로 중단된다.
+    """
+    job_control.start_job("파이프라인 점검")
+    try:
+        logger.info("[scheduler] tick 시작")
+        source_stats = _tick_sources()
+        keyword_stats = _tick_keywords()
+        logger.info("[scheduler] tick 완료")
+        return {
+            "sources_checked": source_stats["checked"],
+            "sources_new_articles": source_stats["new_articles"],
+            "keywords_checked": keyword_stats["checked"],
+            "keywords_new_articles": keyword_stats["new_articles"],
+        }
+    finally:
+        job_control.finish_job()
 
 
 def _tick_sources() -> dict:
@@ -101,6 +112,9 @@ def _tick_sources() -> dict:
         ).all()
 
         for source in sources:
+            if job_control.is_cancelled():
+                logger.info("[scheduler] 사용자 요청으로 소스 점검 중단")
+                break
             if not _due(source.last_attempt_at, source.interval_hours):
                 continue
 
@@ -142,6 +156,9 @@ def _tick_keywords() -> dict:
         collector = COLLECTOR_REGISTRY["google_news_search"]
 
         for kw in keywords:
+            if job_control.is_cancelled():
+                logger.info("[scheduler] 사용자 요청으로 키워드 점검 중단")
+                break
             if not _due(kw.last_collected_at, kw.interval_hours):
                 continue
 
