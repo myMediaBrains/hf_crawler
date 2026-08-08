@@ -39,6 +39,8 @@ import job_control  # 파일 상단에 추가
 import source_scoring
 from statistics import mean
 
+import priority
+
 # 환경 변수 로드
 load_dotenv()
 
@@ -217,6 +219,7 @@ async def lifespan(app: FastAPI):
     create_db_and_tables()
     migrate_db.migrate(DB_NAME)
     migrate_db.migrate_sources(DB_NAME)
+    migrate_db.migrate_translations(DB_NAME)
     migrate_db.migrate_keyword_taxonomy(DB_NAME)
     logger.info("📊 데이터베이스 테이블이 준비되었습니다.")
 
@@ -565,6 +568,7 @@ def study_translate_article(
                 parts.append(seg["text"] + "\n")
                 continue
 
+            priority.yield_to_person()
             translated = model_router.chat(
                 task=task,
                 messages=[
@@ -643,6 +647,7 @@ async def study_translate_article_stream(
 
                     source_sentence = seg["text"]
                     try:
+                        priority.yield_to_person()
                         translated = model_router.chat(
                             task=task,
                             messages=[
@@ -1699,9 +1704,12 @@ def pause_scheduler():
     job_control.pause_collection()
     return {"status": "success", "message": "백그라운드 수집이 일시정지되었습니다."}
 
-
 @app.post("/scheduler/resume")
 def resume_scheduler():
     job_control.resume_collection()
     return {"status": "success", "message": "백그라운드 수집이 재개되었습니다."}
 
+# 백그라운드 크롤링 일시정지 상태 조회
+@app.get("/scheduler/status")
+def get_scheduler_pause_status():
+    return {"paused": job_control.is_paused()}

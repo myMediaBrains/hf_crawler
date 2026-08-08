@@ -57,6 +57,36 @@ SOURCES_MIGRATIONS = [
     ("block_reason", "ALTER TABLE sources ADD COLUMN block_reason TEXT"),
 ]
 
+TRANSLATIONS_MIGRATIONS = [
+    ("block_reason", "ALTER TABLE translations ADD COLUMN block_reason TEXT"),
+]
+
+
+def migrate_translations(db_path: str):
+    """translations 테이블에 block_reason 컬럼을 추가한다. 멱등성 보장."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("PRAGMA table_info(translations)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+    except sqlite3.OperationalError:
+        conn.close()
+        return
+
+    added = []
+    for column_name, sql in TRANSLATIONS_MIGRATIONS:
+        if column_name not in existing_columns:
+            cursor.execute(sql)
+            added.append(column_name)
+
+    if added:
+        conn.commit()
+        logger.info(f"[migrate_db] translations 테이블에 컬럼 추가: {added}")
+    else:
+        logger.info("[migrate_db] translations 테이블 - 추가할 컬럼 없음 (이미 최신 상태)")
+
+    conn.close()
 
 def migrate_sources(db_path: str):
     """sources 테이블에 block_reason 컬럼(블록리스트 사유)을 추가한다. 멱등성 보장."""

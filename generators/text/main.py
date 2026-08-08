@@ -98,7 +98,13 @@ def generate_text(req: GenerateRequest):
             {"role": "user", "content": f"[참고 기사]\n{context_block}\n\n[질문]\n{req.query}"},
         ]
 
-        answer = model_router.chat("personalized_qa", messages)
+        priority.mark_busy()
+        try:
+            answer = model_router.chat("personalized_qa", messages)
+            logger.info(f"[generate] 컨텍스트 글자수: {len(context_block)}, 답변 글자수: {len(answer)}, 참고기사 {len(articles)}건")
+        finally:
+            priority.mark_idle()
+            
         t2 = time.monotonic()
         logger.info(f"[generate] Ollama 응답: {t2-t1:.2f}초")
         model_used = model_router.model_for_task("personalized_qa")

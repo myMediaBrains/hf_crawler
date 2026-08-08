@@ -6,6 +6,7 @@ import { toast, Toaster } from 'react-hot-toast';
 import ArticleCard from './ArticleCard';
 import SourceEvaluation from "./SourceEvaluation";
 import GenreEditor from "./GenreEditor";
+import CrawlToggleButton from "./CrawlToggleButton";
 import './App.css';
 
 
@@ -1035,6 +1036,7 @@ function App() {
                     <button className="platform-info-btn" onClick={handleTogglePlatformInfo}>
                         🧩 구성요소
                     </button>
+                    <CrawlToggleButton />
                 </div>
 
                 {(() => {

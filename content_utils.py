@@ -32,7 +32,10 @@ from crawl4ai.content_filter_strategy import PruningContentFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 
 import model_router
+import priority
 import activity_tracker
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +229,7 @@ def extract_body_via_llm(raw_content: str) -> str:
     )
 
     try:
+        priority.yield_to_person() # 추가: 사람이 기다리고 있으면 최대 15초 양보
         llm_output = model_router.chat(
             task="extract_body",
             messages=[
