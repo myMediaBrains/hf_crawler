@@ -15,6 +15,7 @@ import model_router
 import activity_tracker
 import migrate_db
 import scheduler as scheduler_module
+import taxonomy
 from content_utils import (
     clean_article_content,
     extract_body_via_llm,
@@ -35,6 +36,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlmodel import Session, select, func as sql_func, or_
 
 import job_control  # 파일 상단에 추가
+import source_scoring
+from statistics import mean
 
 # 환경 변수 로드
 load_dotenv()
@@ -167,6 +170,14 @@ class KeywordIntervalSetRequest(BaseModel):
     interval_hours: float = 24.0
 
 
+class GenreCreateRequest(BaseModel):
+    major_category: str
+    mid_category: str
+    sub_category: str
+    months_back: int = 1
+    interval_hours: float = 24.0
+
+
 class SourceCreateRequest(BaseModel):
     name: str
     url: str
@@ -206,9 +217,11 @@ async def lifespan(app: FastAPI):
     create_db_and_tables()
     migrate_db.migrate(DB_NAME)
     migrate_db.migrate_sources(DB_NAME)
+    migrate_db.migrate_keyword_taxonomy(DB_NAME)
     logger.info("📊 데이터베이스 테이블이 준비되었습니다.")
 
     scheduler_module.seed_manual_sources(TARGET_SOURCES)
+    taxonomy.seed_taxonomy_keywords()
 
     config = scheduler_module.get_or_create_config()
     scheduler.add_job(
@@ -978,6 +991,65 @@ def delete_keyword(keyword_id: int, session: Session = Depends(get_session)):
         "message": f"'{name}' 키워드와 수집된 기사 {deleted_count}건을 함께 삭제했습니다."
     }
 
+# 3-1-5. 장르(대분류/중분류/소분류) 등록 - '장르 편집기' 버튼 전용.
+# 소분류(sub_category)가 실제 Keyword.name(백그라운드 검색어)이 되고,
+# 대분류/중분류는 taxonomy 그룹핑용 메타데이터로 저장된다. 이미 같은 이름의
+# 키워드가 있으면(예: taxonomy.py로 미리 시딩된 경우) 분류만 갱신한다.
+@app.post("/genres")
+def create_genre(request: GenreCreateRequest, session: Session = Depends(get_session)):
+    major = request.major_category.strip()
+    mid = request.mid_category.strip()
+    sub = request.sub_category.strip()
+
+    if not major or not mid or not sub:
+        raise HTTPException(status_code=400, detail="대분류/중분류/소분류를 모두 입력해주세요.")
+
+    existing = session.exec(select(Keyword).where(Keyword.name == sub)).first()
+    if existing:
+        existing.major_category = major
+        existing.mid_category = mid
+        session.add(existing)
+        session.commit()
+        return {
+            "status": "success",
+            "message": f"이미 있던 '{sub}' 키워드의 분류를 '{major} > {mid}'로 갱신했습니다."
+        }
+
+    keyword = Keyword(
+        name=sub,
+        major_category=major,
+        mid_category=mid,
+        months_back=request.months_back,
+        interval_hours=request.interval_hours,
+    )
+    session.add(keyword)
+    session.commit()
+    return {
+        "status": "success",
+        "message": f"'{major} > {mid} > {sub}' 장르를 등록했습니다. 백그라운드 수집이 곧 시작됩니다."
+    }
+
+
+# 3-1-6. 장르 목록 조회 - '장르 편집기' 테이블용. 대분류/중분류/소분류 순으로 정렬.
+@app.get("/genres")
+def list_genres(session: Session = Depends(get_session)):
+    keywords = session.exec(select(Keyword)).all()
+    result = []
+
+    for k in keywords:
+        article_count = len(session.exec(select(Article).where(Article.keyword == k.name)).all())
+        result.append({
+            "id": k.id,
+            "major_category": k.major_category or "미분류",
+            "mid_category": k.mid_category or "-",
+            "sub_category": k.name,
+            "article_count": article_count,
+            "interval_hours": k.interval_hours,
+        })
+
+    result.sort(key=lambda x: (x["major_category"], x["mid_category"], x["sub_category"]))
+    return {"genres": result}
+
 
 # 3-2. 키워드 목록 조회 - 키워드 관리 패널(전체 보기)에서 쓸 통계(건수/게시일 범위) 포함
 @app.get("/keywords")
@@ -1037,6 +1109,64 @@ def list_sources(session: Session = Depends(get_session)):
             for s in sources
         ]
     }
+
+@app.get("/sources/evaluation")
+def evaluate_sources(session: Session = Depends(get_session)):
+    """
+    '출처 평가' 버튼 전용 엔드포인트.
+    카테고리(Source.category)별로 소스를 묶어서, 각 소스의 건수/점수/순위를
+    계산해 반환한다. 블록리스트(source_type="blocked")는 평가 대상에서 제외한다.
+    """
+    sources = session.exec(
+        select(Source).where(Source.source_type != "blocked")
+    ).all()
+
+    categories: dict[str, list[dict]] = {}
+
+    for s in sources:
+        articles = session.exec(
+            select(Article).where(Article.source == s.name)
+        ).all()
+
+        article_count = len(articles)
+        lengths = [len(a.content) for a in articles if a.content]
+        avg_length = mean(lengths) if lengths else 0.0
+
+        score_result = source_scoring.compute_score(
+            article_count=article_count,
+            fail_count=s.fail_count,
+            last_success_at=s.last_success_at,
+            avg_content_length=avg_length,
+        )
+
+        category = s.category or "미분류"
+        categories.setdefault(category, []).append({
+            "id": s.id,
+            "name": s.name,
+            "url": s.url,
+            "status": s.status,
+            "article_count": article_count,
+            "fail_count": s.fail_count,
+            "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
+            "score": score_result["total"],
+            "breakdown": score_result["breakdown"],
+        })
+
+    result = []
+    for category, items in categories.items():
+        ranked = sorted(items, key=lambda x: x["score"], reverse=True)
+        for i, item in enumerate(ranked, start=1):
+            item["rank"] = i
+        result.append({
+            "category": category,
+            "source_count": len(ranked),
+            "sources": ranked,
+        })
+
+    # 소스 개수 많은 카테고리(=관심도/활동량 높은 분야)를 위로 정렬
+    result.sort(key=lambda c: c["source_count"], reverse=True)
+
+    return {"categories": result}
 
 
 # 3-4. 소스 수동 등록 (사용자가 직접 발견한 출처 즉시 확정)

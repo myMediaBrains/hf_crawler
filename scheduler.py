@@ -29,8 +29,9 @@ logger = logging.getLogger(__name__)
 
 FAIL_THRESHOLD = 3      # 연속 실패 임계값 - 넘으면 status=FAILING (삭제는 사용자 판단)
 PROMOTE_THRESHOLD = 1   # CandidateSource.hit_count 임계값 - 1이면 "첫 등장 즉시 승격".
-                         # 이전엔 3이라 1~2회만 등장한 출처가 출처관리에 안 보이는
-                         # 문제가 있었음 (기사는 저장되지만 Source 테이블엔 미등록).
+MAX_KEYWORDS_PER_TICK = 5   # taxonomy.py로 한꺼번에 시딩된 키워드가 같은 틱에
+                            # 몰려서 도래해도, 한 틱에 최대 이 건수만 처리하고
+                            # 나머지는 다음 틱으로 자연스럽게 넘긴다 (안전장치).
 
 
 def seed_manual_sources(target_sources: list[dict]):
@@ -173,6 +174,10 @@ def _tick_keywords() -> dict:
             if not _due(kw.last_collected_at, kw.interval_hours):
                 continue
 
+            if checked >= MAX_KEYWORDS_PER_TICK:
+                logger.info(f"[scheduler] 이번 틱 처리 한도({MAX_KEYWORDS_PER_TICK}건) 도달 - 나머지는 다음 틱에서 처리")
+                break
+
             checked += 1
             with activity_tracker.track_component("수집기 · 소스/키워드", f"키워드 수집 중: {kw.name}"):
                 try:
@@ -256,7 +261,9 @@ def _promote_candidate(session: Session, keyword: Keyword, candidate: CandidateS
     session.add(Source(
         name=f"[{keyword.name}] {candidate.source_name}",
         url=query_url,
-        category=keyword.name,
+        category=keyword.major_category or keyword.name,
+        # major_category가 있으면(taxonomy 시딩 키워드) 대분류로 묶고,
+        # 없으면(예전 방식 수동 키워드) 기존처럼 키워드 이름 자체를 카테고리로 유지.
         source_type="google_news_search",
         origin=SourceOrigin.AUTO_PROMOTED,
         interval_hours=keyword.interval_hours,

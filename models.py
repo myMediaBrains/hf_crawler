@@ -213,9 +213,15 @@ class Keyword(SQLModel, table=True):
     interval_hours: float = Field(default=24.0)
     # 검색창 옆 입력창 B: 백그라운드에서 이 키워드를 몇 시간 간격으로 재수집할지.
 
+    major_category: Optional[str] = None
+    # 대분류(장르) - taxonomy.py가 자동 시딩할 때 채운다. "장르별 출처 평가"의
+    # 장르 버튼과 동일한 값이 되도록, 승격 시 Source.category에도 그대로 들어간다.
+    mid_category: Optional[str] = None
+    # 중분류 - 지금은 Keyword.name과 동일한 값이지만, 나중에 사람이 읽기 쉬운
+    # 라벨을 name과 다르게 붙이고 싶을 때를 대비해 분리해뒀다.
+
     last_collected_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
-
 
 # ============================================================
 # 승격 후보 소스 추적 (신규)

@@ -4,7 +4,10 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast, Toaster } from 'react-hot-toast';
 import ArticleCard from './ArticleCard';
+import SourceEvaluation from "./SourceEvaluation";
+import GenreEditor from "./GenreEditor";
 import './App.css';
+
 
 // ============================================
 // 상태 관리 리듀서
@@ -1188,14 +1191,7 @@ function App() {
 
                 <div style={{ display: 'flex', gap: '10px', marginLeft: 'auto' }}>
 
-                    <button 
-                        className="collect-btn" 
-                        style={{ backgroundColor: '#ef4444' }}
-                        onClick={handleCleanExisting} 
-                        disabled={loading}
-                    >
-                        {loading ? '⏳ 작업 중...' : '🧹 데이터 정제'}
-                    </button>
+                    <GenreEditor />
 
                     <button
                         className="collect-btn"
@@ -1204,6 +1200,7 @@ function App() {
                     >
                         ⚙️ 출처 관리
                     </button>
+                    <SourceEvaluation />
                 </div>
             </div>
 

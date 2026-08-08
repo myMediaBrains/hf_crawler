@@ -1898,3 +1898,424 @@ body {
     font-weight: 600;
     white-space: nowrap;
 }
+
+.source-eval-btn {
+  padding: 6px 14px;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  background: #fff;
+  color: #333;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.source-eval-btn:hover {
+  background: #f5f5f5;
+  border-color: #b0b0b0;
+}
+
+.source-eval-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.source-eval-panel {
+  background: #fff;
+  border-radius: 10px;
+  width: min(720px, 92vw);
+  max-height: 82vh;
+  overflow-y: auto;
+  padding: 20px 24px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+}
+
+.source-eval-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #eee;
+  position: sticky;
+  top: 0;
+  background: #fff;
+}
+
+.source-eval-header button {
+  padding: 5px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  background: #fafafa;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.source-eval-header button:hover {
+  background: #eee;
+}
+
+.source-eval-category {
+  margin-bottom: 24px;
+}
+
+.source-eval-category h4 {
+  margin: 0 0 8px 0;
+  font-size: 15px;
+  color: #444;
+}
+
+.source-eval-category table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+.source-eval-category thead th {
+  text-align: left;
+  padding: 6px 8px;
+  color: #888;
+  font-weight: 500;
+  border-bottom: 1px solid #eee;
+}
+
+.source-eval-category tbody td {
+  padding: 7px 8px;
+  border-bottom: 1px solid #f4f4f4;
+  vertical-align: middle;
+}
+
+.source-eval-category tbody tr:hover {
+  background: #fafafa;
+}
+
+.source-eval-category td a {
+  color: #2a5db0;
+  text-decoration: none;
+}
+
+.source-eval-category td a:hover {
+  text-decoration: underline;
+}
+
+.source-eval-btn {
+  padding: 10px 18px;
+  background-color: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.source-eval-btn:hover {
+  border-color: var(--border-hover);
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.source-eval-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.source-eval-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  width: min(900px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 24px;
+  box-shadow: var(--shadow-lg);
+}
+
+.source-eval-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+
+.source-eval-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.source-eval-header button {
+  padding: 5px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all var(--transition-fast);
+}
+
+.source-eval-header button:hover:not(:disabled) {
+  border-color: var(--border-hover);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.source-eval-header button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 스코어 평가기준 - 제목 바로 아래 고정 노출 */
+.source-eval-criteria {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin: 0 0 14px 0;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+/* 장르 버튼 그룹 - 종합 TOP 50 + 장르별 버튼, 이 버튼으로 아래 표를 전환 */
+.source-eval-genre-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  flex-shrink: 0;
+}
+
+.source-eval-genre-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.source-eval-genre-btn:hover {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+
+.source-eval-genre-btn.active {
+  background: var(--primary-color);
+  border-color: var(--primary-color);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* 표 영역만 내부 스크롤 - 헤더/평가기준/장르버튼은 항상 고정 노출 */
+.source-eval-table-wrap {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.source-eval-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+.source-eval-table thead th {
+  text-align: left;
+  padding: 6px 8px;
+  color: var(--text-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border-color);
+  position: sticky;
+  top: 0;
+  background: var(--bg-card);
+}
+
+.source-eval-table tbody td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: middle;
+  color: var(--text-primary);
+}
+
+.source-eval-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.source-eval-table td a {
+  color: var(--primary-color);
+  text-decoration: none;
+}
+
+.source-eval-table td a:hover {
+  text-decoration: underline;
+}
+
+/* ---------------------------------------------------------------------
+   genre-editor-*.css
+   '장르 편집기' 버튼 + 패널 스타일. 기존 App.css 맨 끝에 그대로 붙여넣으세요.
+   다크테마 CSS 변수(--bg-card, --border-color, --text-primary 등)를 재사용합니다.
+--------------------------------------------------------------------- */
+
+.genre-editor-btn {
+  background-color: #059669 !important;
+}
+.genre-editor-btn:hover:not(:disabled) {
+  background-color: #047857 !important;
+}
+
+.genre-editor-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.genre-editor-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  width: min(760px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 24px;
+  box-shadow: var(--shadow-lg);
+}
+
+.genre-editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  flex-shrink: 0;
+}
+
+.genre-editor-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.genre-editor-header button {
+  padding: 5px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.genre-editor-header button:hover {
+  border-color: var(--border-hover);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* 대분류/중분류/소분류 입력 + 추가 버튼 - 맨 위 고정 */
+.genre-editor-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.genre-editor-form input {
+  flex: 1;
+  min-width: 140px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.genre-editor-form input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+/* 표 영역만 내부 스크롤 - 입력창/헤더는 항상 고정 노출 */
+.genre-editor-table-wrap {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.genre-editor-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+.genre-editor-table thead th {
+  text-align: left;
+  padding: 6px 8px;
+  color: var(--text-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border-color);
+  position: sticky;
+  top: 0;
+  background: var(--bg-card);
+}
+
+.genre-editor-table tbody td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: middle;
+  color: var(--text-primary);
+}
+
+.genre-editor-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.genre-editor-delete-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.genre-editor-delete-confirm {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.genre-editor-delete-confirm button {
+  border: none;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.genre-editor-delete-confirm button:first-child {
+  background: #ef4444;
+  color: white;
+}
+
+.genre-editor-delete-confirm button:last-child {
+  background: var(--border-color);
+  color: var(--text-primary);
+}

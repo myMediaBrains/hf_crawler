@@ -83,3 +83,19 @@ def migrate_sources(db_path: str):
         logger.info("[migrate_db] sources 테이블 - 추가할 컬럼 없음 (이미 최신 상태)")
 
     conn.close()
+
+def migrate_keyword_taxonomy(db_name: str) -> None:
+    conn = sqlite3.connect(db_name)
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(keywords)")
+    existing_columns = {row[1] for row in cur.fetchall()}
+
+    if "major_category" not in existing_columns:
+        cur.execute("ALTER TABLE keywords ADD COLUMN major_category TEXT")
+
+    if "mid_category" not in existing_columns:
+        cur.execute("ALTER TABLE keywords ADD COLUMN mid_category TEXT")
+
+    conn.commit()
+    conn.close()
