@@ -58,3 +58,21 @@ def is_cancelled() -> bool:
 def current_job() -> str | None:
     with _lock:
         return _active_job
+
+_paused = False
+
+
+def pause_collection() -> None:
+    """테스트/디버깅 목적으로 백그라운드 수집(scheduler.run_tick)을 일시정지한다.
+    이미 진행 중인 작업을 즉시 중단시키진 않고, 다음 틱부터 건너뛰게 한다."""
+    global _paused
+    _paused = True
+
+
+def resume_collection() -> None:
+    global _paused
+    _paused = False
+
+
+def is_paused() -> bool:
+    return _paused

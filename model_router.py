@@ -151,6 +151,15 @@ TASK_PROFILES: dict[str, dict] = {
             "presence_penalty": 0.0,
         },
     },
+    "personalized_qa": {
+        "tier": ModelTier.LIGHT,   # 채팅형 즉시 응답이라 콜드 로드 34초 부담 있는 HEAVY는 우선 배제
+        "options": {
+            "temperature": 0.8,       # 딱딱한 요약이 아니라 "재밌게" 요청받았으니 다양성 ↑
+            "num_predict": 1536,
+            "num_ctx": 12288,         # 기사 여러 건을 컨텍스트로 넣어야 하므로 넉넉히
+            "presence_penalty": 0.6,  # 여러 기사 인용 시 반복 표현 억제
+        },
+    },
 }
 
 

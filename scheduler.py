@@ -93,6 +93,14 @@ def run_tick() -> dict:
     진행 중이면 이번 틱은 건너뛴다 - 8/7 세션에서 두 작업이 같은 키워드를
     동시에 쓰려다 SQLite "database is locked"가 난 문제의 재발 방지.
     """
+
+    if job_control.is_paused():
+        logger.info("[scheduler] 수집이 일시정지 상태라 이번 틱은 건너뜀")
+        return {
+            "sources_checked": 0, "sources_new_articles": 0,
+            "keywords_checked": 0, "keywords_new_articles": 0,
+        }
+        
     if not job_control.start_job("파이프라인 점검"):
         logger.info(f"[scheduler] 다른 작업이 진행 중이라 이번 틱은 건너뜀 (현재: {job_control.current_job()})")
         return {

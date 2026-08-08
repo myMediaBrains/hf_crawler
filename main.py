@@ -1692,3 +1692,16 @@ def get_platform_info():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# 백그라운드 크롤링 중단 요청 
+@app.post("/scheduler/pause")
+def pause_scheduler():
+    job_control.pause_collection()
+    return {"status": "success", "message": "백그라운드 수집이 일시정지되었습니다."}
+
+
+@app.post("/scheduler/resume")
+def resume_scheduler():
+    job_control.resume_collection()
+    return {"status": "success", "message": "백그라운드 수집이 재개되었습니다."}
+

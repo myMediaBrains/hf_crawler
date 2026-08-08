@@ -320,3 +320,30 @@ class InteractionSignal(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     # DB에는 UTC로 저장 (기존 Article.collected_at과 동일한 관례 유지).
     # KST 표시는 조회/응답 시점에 personalization.py의 to_kst()로 변환한다.
+
+class ContentOrigin(str, Enum):
+    RAW_CRAWL = "raw_crawl"
+    LLM_CLEANED = "llm_cleaned"
+    LLM_TRANSLATED = "llm_translated"
+    USER_EDITED = "user_edited"
+    LLM_GENERATED = "llm_generated"  # 신규: 텍스트 생성기가 처음부터 만든 콘텐츠
+
+
+class TextGeneration(SQLModel, table=True):
+    """개인화 텍스트 생성기의 질의-응답 이력 (append-only, 절대 UPDATE하지 않음)."""
+    __tablename__ = "text_generations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    query: str = Field(nullable=False)
+    answer: str = Field(nullable=False)
+
+    source_article_ids: Optional[str] = None   # JSON 배열 문자열, 예: "[12, 45, 89]"
+    matched_categories: Optional[str] = None   # JSON 배열 문자열
+
+    origin: ContentOrigin = Field(default=ContentOrigin.LLM_GENERATED)
+    model_used: Optional[str] = None
+
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(DateTime, server_default=func.now())
+    )
