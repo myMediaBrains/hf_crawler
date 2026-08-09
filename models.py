@@ -119,6 +119,50 @@ class Notification(SQLModel, table=True):
     def __repr__(self):
         return f"<Notification(id={self.id}, article_id={self.article_id})>"
 
+# ============================================================
+# 사용자 프로필 (신규) — 비밀번호 없는 로컬 개인용 식별자
+# ============================================================
+
+class User(SQLModel, table=True):
+    """
+    사용자가 직접 정하는 문자열 ID로 등록한다 (인증 없음, 로컬 개인용).
+    등록 시점에 personalization.register_user_and_backfill()이 그동안
+    user_id가 비어있던 InteractionSignal/TextGeneration을 이 사용자에게 일괄 귀속시킨다.
+    """
+    __tablename__ = "users"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(unique=True, index=True)
+    display_name: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<User(user_id={self.user_id})>"
+
+
+# ============================================================
+# 배송 로그 (신규) — 어떤 생성 결과를 언제 어디로 보냈는지 기록
+# ============================================================
+
+class Delivery(SQLModel, table=True):
+    """
+    text_generations 한 건을 외부 채널로 보낸 기록. 실험 단계에서는
+    channel="ntfy"(실제 발송) / channel="email"(발송은 안 하고 mailto 링크만
+    만들어준 것 — 사용자가 직접 클릭해서 보냄)을 지원한다.
+    """
+    __tablename__ = "deliveries"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    generation_id: int = Field(foreign_key="text_generations.id", index=True)
+    channel: str = Field(index=True)          # "ntfy" | "email"
+    target: Optional[str] = None              # ntfy topic 또는 이메일 주소
+    status: str = Field(default="pending")    # "pending" | "sent" | "failed"
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Delivery(id={self.id}, channel={self.channel}, status={self.status})>"
+
 
 # ============================================================
 # 기존 UserPreference - 그대로 보존
@@ -292,9 +336,12 @@ class InteractionSignal(SQLModel, table=True):
       (raw_content를 절대 안 건드리는 Article 원칙과 같은 이유 — 나중에 다른 방식으로
       재집계하고 싶을 때 원본이 훼손되지 않아야 하기 때문).
     """
-    __tablename__ = "interaction_signals"
+    _tablename__ = "interaction_signals"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+
+    # 어느 사용자의 신호인지 (없으면 등록 전에 쌓인 신호 — 등록 시 일괄 귀속됨)
+    user_id: Optional[str] = Field(default=None, foreign_key="users.user_id", index=True)
 
     # 어떤 기사/맥락에서 나온 신호인지 (없을 수도 있음 - 예: 순수 채팅 질문)
     article_id: Optional[int] = Field(default=None, foreign_key="articles.id", index=True)
@@ -334,6 +381,12 @@ class TextGeneration(SQLModel, table=True):
     __tablename__ = "text_generations"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: Optional[str] = Field(default=None, foreign_key="users.user_id", index=True)
+
+    conversation_id: Optional[str] = Field(default=None, index=True)
+    stage: str = Field(default="short", index=True)   # "short" | "long"
+    parent_id: Optional[int] = Field(default=None, foreign_key="text_generations.id")
+
     query: str = Field(nullable=False)
     answer: str = Field(nullable=False)
 

@@ -10,10 +10,15 @@ FastAPI 동기 엔드포인트는 스레드풀에서 돌기 때문에, 클라이
 """
 
 import threading
+import time
 
 _cancel_event = threading.Event()
 _lock = threading.Lock()
 _active_job: str | None = None
+
+# scheduler.py의 run_tick()이 쓰는 작업 이름과 반드시 일치해야 한다 (문자열 직접
+# 하드코딩 대신 이 상수를 참조하게 해서 오타로 어긋나는 사고를 방지한다).
+BACKGROUND_TICK_JOB_NAME = "파이프라인 점검"
 
 
 def start_job(name: str) -> bool:
@@ -30,6 +35,48 @@ def start_job(name: str) -> bool:
     with _lock:
         global _active_job
         if _active_job is not None:
+            return False
+        _active_job = name
+        _cancel_event.clear()
+        return True
+
+
+def start_job_with_priority(name: str, max_wait: float = 20.0, poll_interval: float = 0.5) -> bool:
+    """
+    사용자가 직접 트리거한 작업(수동 키워드 수집 등) 전용 진입점.
+    2026-08-09 추가 - 백그라운드 스케줄러 틱이 job_control 락을 쥐고 있으면,
+    지금까지는 사람의 수동 요청이 그냥 409로 거부됐다. 이제는 반대로:
+    - 지금 도는 게 백그라운드 틱(BACKGROUND_TICK_JOB_NAME)이면, 즉시 취소
+      신호를 보내고 틱이 양보할 때까지 짧게 기다렸다가 사람 작업을 우선 진입시킨다.
+    - 지금 도는 게 다른 사람의 수동 작업이면, 기존처럼 거부한다 (사람 vs 사람은
+      순서를 그대로 지켜야 동시쓰기 충돌 재발 방지 원칙이 유지됨).
+    """
+    with _lock:
+        global _active_job
+        if _active_job is None:
+            _active_job = name
+            _cancel_event.clear()
+            return True
+        if _active_job != BACKGROUND_TICK_JOB_NAME:
+            return False
+        _cancel_event.set()  # 백그라운드 틱에 "양보해" 신호 전송
+
+    waited = 0.0
+    while waited < max_wait:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        with _lock:
+            if _active_job is None:
+                break
+            if _active_job != BACKGROUND_TICK_JOB_NAME:
+                # 기다리는 사이 다른 사람 작업이 먼저 새치기함 - 이번엔 양보
+                return False
+
+    with _lock:
+        if _active_job is not None:
+            # max_wait 안에 틱이 못 끝냈다면(개별 URL 크롤링 중이라 최대 30초까지
+            # 걸릴 수 있음) 강제로 빼앗지 않고 이번엔 실패 처리한다 - 데이터
+            # 정합성보다 우선권을 앞세우면 안 되므로.
             return False
         _active_job = name
         _cancel_event.clear()
@@ -59,7 +106,11 @@ def current_job() -> str | None:
     with _lock:
         return _active_job
 
-_paused = False
+# 2026-08-09: 기본값을 True(일시정지)로 변경. 예전엔 False라서, 서버를 재시작할
+# 때마다 (이전에 "중지"를 눌러놨어도) 항상 백그라운드 수집이 자동으로 다시 돌기
+# 시작했다 - 사용자가 명시적으로 "재개"를 누르기 전까지는 절대 스스로 시작하지
+# 않아야 한다는 원칙을 반영.
+_paused = True
 
 
 def pause_collection() -> None:

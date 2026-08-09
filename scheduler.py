@@ -32,6 +32,14 @@ PROMOTE_THRESHOLD = 1   # CandidateSource.hit_count 임계값 - 1이면 "첫 등
 MAX_KEYWORDS_PER_TICK = 5   # taxonomy.py로 한꺼번에 시딩된 키워드가 같은 틱에
                             # 몰려서 도래해도, 한 틱에 최대 이 건수만 처리하고
                             # 나머지는 다음 틱으로 자연스럽게 넘긴다 (안전장치).
+MAX_SOURCES_PER_TICK = 8    # 신규(2026-08-09) - 고정 소스(34개)가 한꺼번에 기한이
+                            # 차면 _tick_sources()가 상한 없이 전부 순서대로 처리하려
+                            # 들어서, 한 번의 틱이 수십 분씩 걸려 그동안 다른 모든
+                            # API가 지연되는 근본 원인이었다. 키워드와 동일한 패턴으로
+                            # 상한을 두고 나머지는 다음 틱으로 자연스럽게 넘긴다.
+KEYWORD_TICK_MAX_ENTRIES = 10  # 백그라운드 틱에서의 키워드당 최대 크롤링 건수.
+                                # 사용자가 직접 누르는 "실시간 수집"(20건)보다 낮게 잡아,
+                                # 백그라운드 작업의 최악 소요시간을 더 짧게 억제한다.
 
 
 def seed_manual_sources(target_sources: list[dict]):
@@ -101,7 +109,7 @@ def run_tick() -> dict:
             "keywords_checked": 0, "keywords_new_articles": 0,
         }
         
-    if not job_control.start_job("파이프라인 점검"):
+    if not job_control.start_job(job_control.BACKGROUND_TICK_JOB_NAME):
         logger.info(f"[scheduler] 다른 작업이 진행 중이라 이번 틱은 건너뜀 (현재: {job_control.current_job()})")
         return {
             "sources_checked": 0, "sources_new_articles": 0,
@@ -134,6 +142,9 @@ def _tick_sources() -> dict:
         for source in sources:
             if job_control.is_cancelled():
                 logger.info("[scheduler] 사용자 요청으로 소스 점검 중단")
+                break
+            if checked >= MAX_SOURCES_PER_TICK:
+                logger.info(f"[scheduler] 이번 틱 소스 처리 한도({MAX_SOURCES_PER_TICK}건) 도달 - 나머지는 다음 틱에서 처리")
                 break
             if not _due(source.last_attempt_at, source.interval_hours):
                 continue
@@ -189,7 +200,7 @@ def _tick_keywords() -> dict:
             checked += 1
             with activity_tracker.track_component("수집기 · 소스/키워드", f"키워드 수집 중: {kw.name}"):
                 try:
-                    result = collector.collect_for_keyword(kw, session)
+                    result = collector.collect_for_keyword(kw, session, max_entries=KEYWORD_TICK_MAX_ENTRIES)
                     new_articles += result.new_count
                     kw.last_collected_at = datetime.now()
                     session.add(kw)

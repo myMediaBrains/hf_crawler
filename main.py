@@ -16,6 +16,7 @@ import activity_tracker
 import migrate_db
 import scheduler as scheduler_module
 import taxonomy
+import time
 from content_utils import (
     clean_article_content,
     extract_body_via_llm,
@@ -40,6 +41,7 @@ import source_scoring
 from statistics import mean
 
 import priority
+import delivery as delivery_channels
 
 # 환경 변수 로드
 load_dotenv()
@@ -56,12 +58,14 @@ from database import engine, get_session, create_db_and_tables
 from models import (
     Article, Translation, Keyword, Source, CandidateSource, SchedulerConfig,
     SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin, BlockedDomain,
+    User, TextGeneration, Delivery,
 )
 
 # 개인화 레이어 import (신규)
 from personalization import (
     classify_and_store, store_explicit_feedback,
     get_profile, get_top_interests,
+    to_kst, register_user_and_backfill,
 )
 
 # 환경 변수
@@ -221,6 +225,8 @@ async def lifespan(app: FastAPI):
     migrate_db.migrate_sources(DB_NAME)
     migrate_db.migrate_translations(DB_NAME)
     migrate_db.migrate_keyword_taxonomy(DB_NAME)
+    migrate_db.migrate_interaction_signals(DB_NAME)
+    migrate_db.migrate_text_generations(DB_NAME)
     logger.info("📊 데이터베이스 테이블이 준비되었습니다.")
 
     scheduler_module.seed_manual_sources(TARGET_SOURCES)
@@ -241,7 +247,16 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("🚀 APScheduler 백그라운드 수집기가 시작되었습니다.")
     yield
-    scheduler.shutdown()
+    # 종료 직전에 지금 실행 중인 크롤링 작업이 있다면 취소 신호부터 보낸다.
+    # 이 신호가 없으면 크롤링 루프가 스스로 멈출 계기가 없어서, wait=False를
+    # 줘도 그 작업을 돌리고 있는 스레드(APScheduler 내부 ThreadPoolExecutor -
+    # daemon이 아님)가 자연 종료될 때까지 프로세스가 못 죽는다. 크롤링 루프는
+    # URL 하나 처리할 때마다 is_cancelled()를 확인하므로, 이 신호를 보내면
+    # 늦어도 현재 처리 중인 URL의 하드 타임아웃(최대 30초) 안에는 멈춘다.
+    cancelled_job = job_control.cancel_current_job()
+    if cancelled_job:
+        logger.info(f"[shutdown] 진행 중이던 작업에 취소 신호 전송: {cancelled_job}")
+    scheduler.shutdown(wait=False)
     logger.info("🛑 APScheduler가 안전하게 종료되었습니다.")
 
 
@@ -515,9 +530,61 @@ def fix_article_source_names(session: Session = Depends(get_session)):
 # 개인화 프로필 API (신규)
 # ============================================
 
+# ============================================
+# 사용자 프로필 API (신규)
+# ============================================
+
+class UserRegisterRequest(BaseModel):
+    user_id: str
+    display_name: str | None = None
+
+
+@app.post("/users/register")
+def register_user(request: UserRegisterRequest, session: Session = Depends(get_session)):
+    """
+    비밀번호 없는 로컬 개인용 사용자 등록. user_id는 사용자가 직접 정한 문자열.
+    등록 성공 시, 그동안 user_id 없이 쌓인 InteractionSignal/TextGeneration을
+    전부 이 사용자에게 일괄 귀속시킨다.
+    """
+    try:
+        result = register_user_and_backfill(
+            session, user_id=request.user_id, display_name=request.display_name
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    return {
+        "status": "success",
+        "message": (
+            f"'{result['user_id']}' 사용자로 등록되었습니다. "
+            f"기존 데이터 {result['backfilled_signals']}건(신호), "
+            f"{result['backfilled_generations']}건(생성이력)을 귀속했습니다."
+        ),
+        **result,
+    }
+
+
+@app.get("/users/me")
+def get_current_user(user_id: str, session: Session = Depends(get_session)):
+    """프론트가 localStorage에 저장해둔 user_id로 등록 여부/표시이름을 확인할 때 사용."""
+    user = session.exec(select(User).where(User.user_id == user_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="등록되지 않은 사용자입니다.")
+    return {
+        "user_id": user.user_id,
+        "display_name": user.display_name,
+        "created_at_kst": to_kst(user.created_at),
+    }
+
+
+# ============================================
+# 개인화 프로필 API (기존 + user_id 연결)
+# ============================================
+
 class ExplicitFeedbackRequest(BaseModel):
     article_id: int
     positive: bool  # True=👍, False=👎
+    user_id: str | None = None
 
 
 @app.post("/personalization/feedback")
@@ -526,23 +593,92 @@ def submit_feedback(request: ExplicitFeedbackRequest, session: Session = Depends
     기사 카드에 👍/👎 버튼을 추가하고 여기로 연결한다.
     프론트에서는 ArticleCard.jsx 하단에 버튼 두 개만 추가하면 됨.
     """
-    signal = store_explicit_feedback(session, article_id=request.article_id, positive=request.positive)
+    signal = store_explicit_feedback(
+        session, article_id=request.article_id, positive=request.positive, user_id=request.user_id
+    )
     if signal is None:
         raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없거나 분류할 수 없습니다.")
     return {"status": "success", "subcategory": signal.subcategory, "weight": signal.weight}
 
 
 @app.get("/personalization/profile")
-def get_personalization_profile(session: Session = Depends(get_session)):
-    """현재까지 쌓인 개인화 프로필 전체 (시간 가중 감쇠 적용된 상태)."""
-    return {"profile": get_profile(session)}
+def get_personalization_profile(user_id: str | None = None, session: Session = Depends(get_session)):
+    """현재까지 쌓인 개인화 프로필 전체 (시간 가중 감쇠 적용된 상태). user_id 생략 시 전체 집계."""
+    return {"profile": get_profile(session, user_id=user_id)}
 
 
 @app.get("/personalization/top-interests")
-def get_personalization_top_interests(n: int = Query(5), session: Session = Depends(get_session)):
-    """챗봇/보고서 생성 프롬프트에 주입할 상위 관심사."""
-    top = get_top_interests(session, n=n)
+def get_personalization_top_interests(
+    n: int = Query(5), user_id: str | None = None, session: Session = Depends(get_session)
+):
+    """챗봇/보고서 생성 프롬프트에 주입할 상위 관심사. user_id 생략 시 전체 집계."""
+    top = get_top_interests(session, n=n, user_id=user_id)
     return {"top_interests": [{"subcategory": s, **d} for s, d in top]}
+
+
+# ============================================
+# 배송 API (신규, 실험 단계 - ntfy/mailto, 무자격증명)
+# ============================================
+
+class DeliverRequest(BaseModel):
+    generation_id: int
+    channel: str              # "ntfy" | "email"
+    target: str | None = None  # ntfy는 topic, email은 (선택) 수신 주소
+
+
+@app.post("/deliver")
+def deliver_generation(request: DeliverRequest, session: Session = Depends(get_session)):
+    generation = session.get(TextGeneration, request.generation_id)
+    if generation is None:
+        raise HTTPException(status_code=404, detail="해당 생성 결과를 찾을 수 없습니다.")
+
+    dlv = Delivery(
+        generation_id=generation.id,
+        channel=request.channel,
+        target=request.target,
+        status="pending",
+    )
+
+    response_extra: dict = {}
+
+    if request.channel == "ntfy":
+        if not request.target:
+            raise HTTPException(status_code=400, detail="ntfy는 topic(target)이 필요합니다.")
+        ok, err = delivery_channels.send_ntfy(
+            topic=request.target,
+            title="hf_crawler",
+            message=generation.answer,
+        )
+        dlv.status = "sent" if ok else "failed"
+        dlv.error_message = err
+        if not ok:
+            session.add(dlv)
+            session.commit()
+            raise HTTPException(status_code=502, detail=f"ntfy 발송 실패: {err}")
+
+    elif request.channel == "email":
+        mailto_url = delivery_channels.build_mailto_link(
+            to_hint=request.target,
+            subject="hf_crawler 보고서",
+            body=generation.answer,
+        )
+        dlv.status = "sent"  # "사용자에게 전달할 준비 완료"라는 의미로 기록
+        response_extra["mailto_url"] = mailto_url
+
+    else:
+        raise HTTPException(status_code=400, detail=f"지원하지 않는 채널: {request.channel}")
+
+    session.add(dlv)
+    session.commit()
+
+    # 취향 축적 (5단계) - 배송 클릭은 가장 강한 긍정 신호(weight=2.5)
+    if generation.user_id:
+        classify_and_store(
+            session, text_title=generation.query, source="chat_delivered",
+            signal_type="implicit", weight=2.5, user_id=generation.user_id,
+        )
+
+    return {"status": "success", "channel": request.channel, **response_extra}
 
 
 # 1. 동기식 문장 대조 번역 API
@@ -744,16 +880,25 @@ def _collect_single_keyword(
     session: Session,
     months_back: int = 1,
     interval_hours: float = 24.0,
+    max_entries: int = 20,
+    register: bool = True,
 ) -> dict:
     """
     검색창에 입력된 키워드 하나만 즉시 강제 수집한다 (due 체크 무시, 다른
     소스/키워드는 절대 건드리지 않는다). "파이프라인 수집" 버튼에 검색어가
     들어있을 때 이 함수가 호출된다.
 
-    아직 등록되지 않은 키워드면 여기서 자동으로 등록한 뒤 바로 수집한다
-    ("검색/등록"을 따로 먼저 눌러야만 하는 불편함을 없애기 위함 - 8/7 세션에서
-    사용자 피드백으로 반영됨). months_back/interval_hours는 검색창 옆
-    수집 옵션(⚙)에서 설정한 값을 그대로 받아 신규 등록 시 적용한다.
+    register=True(기본값, 사람이 직접 검색창에 입력한 경우): 아직 등록되지
+    않은 키워드면 여기서 자동으로 영구 등록한 뒤 바로 수집한다 ("검색/등록"을
+    따로 먼저 눌러야만 하는 불편함을 없애기 위함 - 8/7 세션에서 사용자 피드백으로
+    반영됨).
+
+    register=False(채팅 자동수집 전용, 2026-08-09 추가): DB에 Keyword 행을
+    남기지 않고 이번 한 번만 수집한다. 채팅에서 "근거 부족"으로 판단될 때마다
+    호출되는데, register=True로 두면 사용자가 검색창에 입력한 적도 없는
+    키워드(심지어 채팅 질문 원문 그대로)가 스케줄러에 영구 등록되어 매일
+    반복 수집되는 문제가 있었다 - 등록된 키워드가 많아질수록 스케줄러 틱마다
+    처리할 일이 계속 늘어나 백그라운드 부하가 누적되는 근본 원인이었다.
     """
     keyword = session.exec(select(Keyword).where(Keyword.name == keyword_name)).first()
     auto_registered = False
@@ -763,24 +908,28 @@ def _collect_single_keyword(
             months_back=months_back,
             interval_hours=interval_hours,
         )
-        session.add(keyword)
-        session.commit()
-        session.refresh(keyword)
-        auto_registered = True
-        logger.info(f"[collect] '{keyword_name}' 키워드 자동 등록 (파이프라인 수집에서)")
+        if register:
+            session.add(keyword)
+            session.commit()
+            session.refresh(keyword)
+            auto_registered = True
+            logger.info(f"[collect] '{keyword_name}' 키워드 자동 등록 (파이프라인 수집에서)")
+        else:
+            logger.info(f"[collect] '{keyword_name}' 일회성 수집 (영구 등록 안 함)")
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
-    if not job_control.start_job(f"키워드 수집: {keyword.name}"):
+    if not job_control.start_job_with_priority(f"키워드 수집: {keyword.name}"):
         raise HTTPException(
             status_code=409,
-            detail=f"다른 수집 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
+            detail=f"다른 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
         )
     try:
-        result = collector.collect_for_keyword(keyword, session)
-        keyword.last_collected_at = datetime.now()
-        session.add(keyword)
-        session.commit()
-        scheduler_module._track_candidates(session, keyword, result.discovered_domains)
+        result = collector.collect_for_keyword(keyword, session, max_entries=max_entries)
+        if register:
+            keyword.last_collected_at = datetime.now()
+            session.add(keyword)
+            session.commit()
+            scheduler_module._track_candidates(session, keyword, result.discovered_domains)
         new_count = result.new_count
     except Exception as e:
         logger.error(f"키워드 단독 수집 실패 ({keyword_name}): {e}")
@@ -813,10 +962,11 @@ def collect_deep_incremental(
     keyword: str | None = Query(None),
     months_back: int = Query(1),
     interval_hours: float = Query(24.0),
+    max_entries: int = Query(20),
     session: Session = Depends(get_session),
 ):
     if keyword and keyword.strip():
-        return _collect_single_keyword(keyword.strip(), session, months_back, interval_hours)
+        return _collect_single_keyword(keyword.strip(), session, months_back, interval_hours, max_entries)
 
     stats = scheduler_module.run_tick()
     total = stats["sources_new_articles"] + stats["keywords_new_articles"]
@@ -852,7 +1002,7 @@ def create_keyword(request: KeywordCreateRequest, session: Session = Depends(get
     session.refresh(keyword)
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
-    if not job_control.start_job(f"키워드 등록: {keyword.name}"):
+    if not job_control.start_job_with_priority(f"키워드 등록: {keyword.name}"):
         logger.warning(f"키워드 등록 즉시수집 스킵 - 다른 작업 진행 중 (현재: {job_control.current_job()})")
         return {
             "status": "success",
@@ -892,10 +1042,10 @@ def recollect_keyword(keyword_id: int, session: Session = Depends(get_session)):
         raise HTTPException(status_code=404, detail="해당 키워드를 찾을 수 없습니다.")
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
-    if not job_control.start_job(f"키워드 재수집: {keyword.name}"):
+    if not job_control.start_job_with_priority(f"키워드 재수집: {keyword.name}"):
         raise HTTPException(
             status_code=409,
-            detail=f"다른 수집 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
+            detail=f"다른 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
         )
     try:
         result = collector.collect_for_keyword(keyword, session)
@@ -1488,6 +1638,21 @@ def export_to_vault(request: VaultExportRequest):
 # 버튼에 찍힌 건수와 실제로 열리는 기사 수가 서로 달랐다 (예: 정치 2건 표시,
 # 클릭하면 4건 조회). 아래 함수 하나로 두 엔드포인트를 통일한다.
 # ============================================
+# CATEGORY_CONFIG의 키워드별 정규식을 프로세스 시작 시 딱 한 번만 컴파일해서 재사용한다.
+# 예전엔 _score_categories_for_article()이 호출될 때마다(기사마다!) re.escape+정규식
+# 컴파일을 새로 했는데, 기사가 수천 건으로 늘어나면서 /stats/keywords 한 번 호출에
+# 이 컴파일이 "기사 수 x 카테고리 수 x 키워드 수"만큼 반복되어 몇 분씩 걸리는 상태였다.
+# 이 무거운 계산이 GIL을 오래 쥐고 있으면서 다른 API 요청들까지 전부 지연되는
+# 원인이었다 (2026-08-09, 출처관리/키워드현황 등 전체 버튼 지연 사태의 근본 원인).
+_COMPILED_CATEGORY_PATTERNS: dict[str, list[tuple[str, re.Pattern]]] = {
+    category: [
+        (term, re.compile(r'(?:^|\b|[^\w])' + re.escape(term) + r'(?:$|\b|[^\w])', re.IGNORECASE))
+        for term in config["keywords"]
+    ]
+    for category, config in CATEGORY_CONFIG.items()
+}
+
+
 def _score_categories_for_article(article: Article) -> dict[str, int]:
     """기사 하나에 대해, 블랙리스트에 걸리지 않은 카테고리별 매칭 점수를 계산한다."""
     title_lower = (article.title or "").lower()
@@ -1509,10 +1674,9 @@ def _score_categories_for_article(article: Article) -> dict[str, int]:
         if category.lower() in source_lower:
             score += 10
 
-        for term in config["keywords"]:
-            pattern = r'(?:^|\b|[^\w])' + re.escape(term) + r'(?:$|\b|[^\w])'
-            title_matches = len(re.findall(pattern, title_lower, re.IGNORECASE))
-            content_matches = len(re.findall(pattern, content_lower, re.IGNORECASE))
+        for term, compiled_pattern in _COMPILED_CATEGORY_PATTERNS[category]:
+            title_matches = len(compiled_pattern.findall(title_lower))
+            content_matches = len(compiled_pattern.findall(content_lower))
             score += (title_matches * 3) + (content_matches * 1)
 
         if score > 0:
@@ -1530,20 +1694,32 @@ def _best_category_for_article(article: Article) -> str | None:
 
 
 # 9. 키워드 통계 API
+_keyword_stats_cache: dict = {"data": None, "computed_at": 0.0}
+# 8초였던 걸 60초로 대폭 연장 (2026-08-09) - 기사가 3,600건+ 쌓인 지금은 이
+# 계산 자체가 몇 초~심하면 100초 넘게 걸릴 수 있는데, 캐시 유효시간이 폴링
+# 주기(10초)보다 짧으면 캐시가 사실상 무의미해서 계산이 끝나기도 전에 다음
+# 폴링이 또 새 계산을 시작하는 악순환(점점 느려지는 요청이 계속 쌓임)에 빠졌었다.
+_KEYWORD_STATS_CACHE_TTL = 60.0
+
 @app.get("/stats/keywords")
 def get_keyword_stats(session: Session = Depends(get_session)):
-    articles = session.exec(select(Article)).all()
+    now = time.monotonic()
+    if _keyword_stats_cache["data"] is not None and (now - _keyword_stats_cache["computed_at"]) < _KEYWORD_STATS_CACHE_TTL:
+        return _keyword_stats_cache["data"]
 
-    stats = {cat: 0 for cat in CATEGORY_CONFIG.keys()}
+    # 카테고리별 건수 - 저장 시점에 미리 계산해둔 Article.category를 SQL
+    # GROUP BY로 집계한다 (2026-08-09, 근본 해결). 예전엔 기사 전체를 매번
+    # 파이썬으로 순회하며 정규식 재매칭했는데, 3,600건 기준 실측 116초가
+    # 걸렸던 게 이 방식으로는 수 밀리초로 끝난다.
+    # ⚠️ 기존에 저장된 기사는 category가 비어있으므로, 반영 즉시는 값이
+    # 비어보일 수 있다 - /admin/backfill-categories를 한 번 호출해서 채워야 함.
+    category_counts = session.exec(
+        select(Article.category, sql_func.count(Article.id))
+        .where(Article.category.is_not(None))
+        .group_by(Article.category)
+    ).all()
+    filtered_stats = {cat: cnt for cat, cnt in category_counts if cat}
 
-    for article in articles:
-        best_category = _best_category_for_article(article)
-        if best_category:
-            stats[best_category] += 1
-
-    filtered_stats = {k: v for k, v in stats.items() if v > 0}
-
-    # 사용자가 등록한 실제 키워드(Keyword.name)의 정확한 카운트도 병합
     registered_counts = session.exec(
         select(Article.keyword, sql_func.count(Article.id))
         .where(Article.keyword.is_not(None))
@@ -1553,10 +1729,59 @@ def get_keyword_stats(session: Session = Depends(get_session)):
         if kw_name:
             filtered_stats[kw_name] = cnt
 
-    return {"keyword_stats": filtered_stats}
+    result = {"keyword_stats": filtered_stats}
+    _keyword_stats_cache["data"] = result
+    _keyword_stats_cache["computed_at"] = now
+    return result
+
+@app.post("/admin/backfill-categories")
+def backfill_article_categories(session: Session = Depends(get_session)):
+    """
+    일회성 관리 작업 - category가 비어있는 기존 기사들에 카테고리를 채운다.
+    이번 패치 적용 후 딱 한 번만 호출하면 됨 (그 이후 기사는 저장 시점에
+    자동으로 채워지므로 다시 돌릴 필요 없음). 기사가 많으면 시간이 걸릴 수
+    있으니 오래 걸려도 정상이다.
+    """
+    articles = session.exec(select(Article).where(Article.category.is_(None))).all()
+    updated = 0
+    for article in articles:
+        category = _best_category_for_article(article)
+        if category:
+            article.category = category
+            session.add(article)
+            updated += 1
+        if updated % 200 == 0 and updated > 0:
+            session.commit()  # 오래 걸려도 DB 잠금을 짧게 나눠서 유지
+    session.commit()
+    return {
+        "status": "success",
+        "message": f"기존 기사 {len(articles)}건 중 {updated}건에 카테고리를 채웠습니다."
+    }
 
 
 # 10. 아티클 목록 조회 API
+# 목록 조회 시 본문을 이 길이까지만 잘라서 보낸다. 기사가 많아지면서 전체 본문을
+# 매번 통째로 내려주는 게 /articles 응답을 느리게 만드는 주요 원인이었음 (2026-08-09).
+# 펼치기/편집 시에만 아래 GET /articles/{id}/full로 전체 본문을 따로 불러온다.
+_ARTICLE_PREVIEW_LENGTH = 400
+
+
+def _serialize_article_preview(a: Article) -> dict:
+    content = a.content or ""
+    truncated = len(content) > _ARTICLE_PREVIEW_LENGTH
+    preview = content[:_ARTICLE_PREVIEW_LENGTH].rstrip() + "…" if truncated else content
+    return {
+        "id": a.id,
+        "title": a.title,
+        "url": a.url,
+        "published_at": a.published_at,
+        "content": preview,
+        "content_truncated": truncated,
+        "source": a.source,
+    }
+
+
+# 아티클 목록 조회 API (본문은 미리보기만 - 전체 본문은 /articles/{id}/full 참고)
 @app.get("/articles")
 def get_articles(
     keyword: str = Query(None),
@@ -1565,19 +1790,7 @@ def get_articles(
     if not keyword:
         query = select(Article).order_by(Article.id.desc())
         articles = session.exec(query).all()
-        return {
-            "articles": [
-                {
-                    "id": a.id,
-                    "title": a.title,
-                    "url": a.url,
-                    "published_at": a.published_at,
-                    "content": a.content,
-                    "source": a.source
-                }
-                for a in articles
-            ]
-        }
+        return {"articles": [_serialize_article_preview(a) for a in articles]}
 
     clean_kw = keyword.strip()
 
@@ -1601,11 +1814,8 @@ def get_articles(
                 break
 
         if matched_category:
-            all_articles = session.exec(select(Article).order_by(Article.id.desc())).all()
-            articles = [
-                a for a in all_articles
-                if _best_category_for_article(a) == matched_category
-            ]
+            query = select(Article).where(Article.category == matched_category).order_by(Article.id.desc())
+            articles = session.exec(query).all()
         else:
             # 어떤 고정 카테고리에도 안 걸리는 임의의 검색어 - 기존처럼 단순 텍스트 포함 검색으로 폴백
             query = select(Article).where(
@@ -1613,19 +1823,16 @@ def get_articles(
             ).order_by(Article.id.desc())
             articles = session.exec(query).all()
 
-    return {
-        "articles": [
-            {
-                "id": a.id,
-                "title": a.title,
-                "url": a.url,
-                "published_at": a.published_at,
-                "content": a.content,
-                "source": a.source
-            }
-            for a in articles
-        ]
-    }
+    return {"articles": [_serialize_article_preview(a) for a in articles]}
+
+
+# 아티클 전체 본문 조회 (펼치기/편집 시에만 호출)
+@app.get("/articles/{article_id}/full")
+def get_article_full_content(article_id: int, session: Session = Depends(get_session)):
+    article = session.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없습니다.")
+    return {"id": article.id, "content": article.content}
 
 
 # 11. 수집 상태 확인 API

@@ -7,6 +7,8 @@ import ArticleCard from './ArticleCard';
 import SourceEvaluation from "./SourceEvaluation";
 import GenreEditor from "./GenreEditor";
 import CrawlToggleButton from "./CrawlToggleButton";
+import UserRegister from "./UserRegister";
+import ChatWindow from "./ChatWindow";
 import './App.css';
 
 
@@ -290,6 +292,36 @@ function App() {
         }
     }, [API_URL]);
 
+    // 목록에는 미리보기 본문만 있으므로, 펼치기/편집 시 전체 본문을 따로 불러와
+    // articles 상태의 해당 항목만 갱신한다. 반환값을 직접 써야 하는 호출부(편집
+    // 시작 등)를 위해 가져온 전체 본문 문자열도 함께 반환한다.
+    const fetchFullArticleContent = useCallback(async (articleId) => {
+        try {
+            const response = await axios.get(`${API_URL}/articles/${articleId}/full`);
+            const fullContent = response.data.content;
+            setArticles((prev) =>
+                prev.map((a) =>
+                    a.id === articleId ? { ...a, content: fullContent, content_truncated: false } : a
+                )
+            );
+            return fullContent;
+        } catch (err) {
+            console.error("전체 본문 조회 에러:", err);
+            toast.error('본문을 불러오지 못했습니다.');
+            return null;
+        }
+    }, [API_URL]);
+
+    // 카드 헤더 클릭(펼치기/접기) - 아직 미리보기 상태(content_truncated)인데
+    // 펼치는 경우에만 전체 본문을 불러온다. 이미 불러온 적 있으면 재요청 안 함.
+    const handleExpandArticle = (article) => {
+        const next = !articleStates.expanded[article.id];
+        dispatch({ type: 'SET_EXPANDED', id: article.id, value: next });
+        if (next && article.content_truncated) {
+            fetchFullArticleContent(article.id);
+        }
+    };
+
     const fetchKeywordStats = useCallback(async () => {
         try {
             const response = await axios.get(`${API_URL}/stats/keywords`);
@@ -369,10 +401,12 @@ function App() {
         }, POLLING_INTERVAL);
 
         // 키워드별 현황은 초 단위로 자주 바뀔 필요는 없으니 조금 더 긴 주기로 폴링
-        // (너무 짧으면 백엔드에 불필요한 부하)
+        // (너무 짧으면 백엔드에 불필요한 부하). 기사량이 늘면서 계산 자체가 무거워져
+        // 5배(10초)로는 부족했음 - 15배(30초)로 늘려 백엔드 캐시(60초) 주기와 여유
+        // 있게 맞춘다 (2026-08-09).
         const keywordStatsInterval = setInterval(() => {
             fetchKeywordStats();
-        }, POLLING_INTERVAL * 5);
+        }, POLLING_INTERVAL * 15);
 
         return () => {
             clearInterval(statsInterval);
@@ -512,30 +546,46 @@ function App() {
 
     const handleDeleteArticle = async (articleId) => {
         const toastId = toast.loading('삭제 중...');
+
+        // 낙관적 업데이트: 서버 응답(전체 재조회)을 기다리지 않고 화면에서
+        // 즉시 지운다. 예전엔 삭제 API 응답 후 GET /articles 전체를 다시
+        // 불러와서 화면을 갱신했는데, 기사가 많이 쌓인 지금은 이 재조회 자체가
+        // 체감될 만큼 걸려서 "삭제 완료 메시지는 바로 뜨는데 실제로는 1초 뒤에
+        // 사라지는" 어색한 지연이 있었다 (2026-08-09).
+        setArticles((prev) => prev.filter((a) => a.id !== articleId));
+        if (pinnedArticleIdRef.current === articleId) {
+            pinnedArticleIdRef.current = null;
+        }
+        dispatch({ type: 'RESET_ARTICLE_STATE', id: articleId });
+
         try {
             const response = await axios.delete(`${API_URL}/articles/${articleId}`);
             setMessage(response.data.message);
             toast.success('삭제 완료!', { id: toastId });
-
-            if (pinnedArticleIdRef.current === articleId) {
-                pinnedArticleIdRef.current = null;
-            }
-            dispatch({ type: 'RESET_ARTICLE_STATE', id: articleId });
-            await fetchArticles(keyword);
-            await fetchKeywordStats();
-            await fetchSystemStats();
+            // 통계는 화면을 막지 않고 백그라운드로만 갱신 (await 안 함)
+            fetchKeywordStats();
+            fetchSystemStats();
         } catch (err) {
             console.error("삭제 에러:", err);
             setMessage('기사 삭제 중 에러가 발생했습니다.');
-            toast.error('삭제 실패', { id: toastId });
+            toast.error('삭제 실패 - 목록을 다시 불러옵니다', { id: toastId });
+            // 실패했다면 낙관적으로 지운 게 잘못된 것이므로 서버 기준으로 복구
+            await fetchArticles(keyword);
         }
     };
 
-    const handleToggleEdit = (article) => {
+    const handleToggleEdit = async (article) => {
         pinArticleToTop(article.id);
         const isEditing = !!articleStates.editing[article.id];
         if (!isEditing) {
-            dispatch({ type: 'SET_EDIT_CONTENT', id: article.id, value: article.content });
+            // 미리보기(잘린 본문)로 편집창을 채우면 저장 시 뒷부분이 통째로 날아가므로,
+            // 편집을 시작하기 전엔 반드시 전체 본문을 먼저 확보한다.
+            let fullContent = article.content;
+            if (article.content_truncated) {
+                const fetched = await fetchFullArticleContent(article.id);
+                if (fetched !== null) fullContent = fetched;
+            }
+            dispatch({ type: 'SET_EDIT_CONTENT', id: article.id, value: fullContent });
         }
         dispatch({ type: 'SET_EDITING', id: article.id, value: !isEditing });
     };
@@ -1024,10 +1074,15 @@ function App() {
                     }
                 }}
             />
+
+            <ChatWindow />
             
             <header className="app-header">
-                <h1>🚀 Local Trend & Deep Content Inspector</h1>
-                
+                <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+                    <h1>🚀 Local Trend & Deep Content Inspector</h1>
+                    <UserRegister />
+                </div>
+
                 <div className="system-monitor-bar">
                     <div>🖥️ <strong>CPU:</strong> <span style={{ color: '#60a5fa' }}>{systemStats.cpu_usage}</span></div>
                     <div>🎮 <strong>GPU:</strong> <span style={{ color: '#34d399' }}>{systemStats.gpu_usage}</span></div>
@@ -1610,6 +1665,7 @@ function App() {
                             onTranslate={handleTranslate}
                             onToggleKoreanOnly={handleToggleKoreanOnly}
                             onToggleEdit={handleToggleEdit}
+                            onExpandArticle={handleExpandArticle}
                             onSaveContent={handleSaveContent}
                             onDeleteArticle={handleDeleteArticle}
                             onCleanArticle={handleCleanSingleArticle}

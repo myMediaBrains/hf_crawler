@@ -96,6 +96,14 @@ class RSSCollector(BaseCollector):
                 source=source.name,
                 origin=ContentOrigin.RAW_CRAWL,
             )
+            # 저장 시점에 카테고리를 미리 계산해둔다 (2026-08-09) - 예전엔
+            # /stats/keywords가 매번 기사 전체를 순회하며 재계산해서, 기사가
+            # 쌓일수록(3,600건+ 기준 실측 116초) 점점 느려지는 근본 원인이었다.
+            # main.py는 collectors.py를 import하므로, 반대 방향 import는
+            # 순환참조가 나서 함수 호출 시점에 지연 import한다.
+            from main import _best_category_for_article
+            article.category = _best_category_for_article(article)
+
             session.add(article)
             session.flush()  # commit 전에 article.id를 확보하기 위한 flush
             # 고정 RSS 수집 = 사용자가 직접 요청한 게 아니라 백그라운드에서
@@ -135,7 +143,7 @@ class GoogleNewsSearchCollector(BaseCollector):
             track_domains=False,
         )
 
-    def collect_for_keyword(self, keyword: Keyword, session: Session) -> CollectResult:
+    def collect_for_keyword(self, keyword: Keyword, session: Session, max_entries: int = 20) -> CollectResult:
         query_url = self._build_keyword_search_url(keyword.name, keyword.months_back)
         return self._fetch_and_save(
             query_url=query_url,
@@ -143,6 +151,7 @@ class GoogleNewsSearchCollector(BaseCollector):
             keyword_name=keyword.name,
             session=session,
             track_domains=True,
+            max_entries=max_entries,
         )
 
     def _fetch_and_save(
@@ -152,6 +161,7 @@ class GoogleNewsSearchCollector(BaseCollector):
         keyword_name: str | None,
         session: Session,
         track_domains: bool,
+        max_entries: int = 20,
     ) -> CollectResult:
         new_count = 0
         discovered: list[tuple[str, str]] = []
@@ -166,7 +176,12 @@ class GoogleNewsSearchCollector(BaseCollector):
         # 전체에서 한 번만 조회해두고, 아래 루프에서 나올 때마다 즉시 건너뛴다.
         blocked_domains = {b.domain for b in session.exec(select(BlockedDomain)).all()}
 
-        for entry in feed.entries[:20]:
+        # max_entries*30초(개별 크롤링 하드 타임아웃)가 이 함수 전체의 이론상 최대
+        # 소요 시간이다 - 기본 20건이면 최악 10분까지 동기 요청 스레드 하나를 붙잡을
+        # 수 있어서, 채팅에서 자동으로 트리거되는 가벼운 확인 수집은 max_entries를
+        # 낮게(예: 5) 넘겨서 부담을 줄인다 (2026-08-09, 자동수집 기능 추가 후 실사용
+        # 중 다른 버튼들이 전부 지연되는 문제를 겪고 나서 추가됨).
+        for entry in feed.entries[:max_entries]:
             if job_control.is_cancelled():
                 logger.info("[GoogleNewsSearchCollector] 사용자 요청으로 수집 중단")
                 break
@@ -221,8 +236,13 @@ class GoogleNewsSearchCollector(BaseCollector):
                 keyword=keyword_name,
                 origin=ContentOrigin.RAW_CRAWL,
             )
+            # 저장 시점에 카테고리 미리 계산 (1-1과 동일한 이유)
+            from main import _best_category_for_article
+            article.category = _best_category_for_article(article)
+
             session.add(article)
             session.flush()  # commit 전에 article.id를 확보하기 위한 flush
+
             # 키워드 검색 수집 = 사용자가 검색창에 직접 입력한 키워드에서 나온 결과이므로
             # RSS 고정 수집보다 더 강한 신호로 취급한다(weight=0.5, signal_type="explicit").
             classify_and_store(
@@ -235,7 +255,12 @@ class GoogleNewsSearchCollector(BaseCollector):
             if track_domains:
                 discovered.append((domain, extracted_name))
 
-        session.commit()
+            # 기사 하나 처리할 때마다 즉시 커밋한다. 예전엔 루프 전체가 끝나야
+            # 커밋해서, 크롤링이 진행되는 몇 분 동안 DB 쓰기 트랜잭션이 계속
+            # 열려있었다 - 그 사이 다른 요청(키워드 삭제 등)이 락에 걸려
+            # "아무것도 안 먹는" 것처럼 보이는 문제의 원인이었다 (2026-08-09).
+            session.commit()
+
         return CollectResult(new_count=new_count, discovered_domains=discovered)
 
     

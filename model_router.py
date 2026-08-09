@@ -160,6 +160,27 @@ TASK_PROFILES: dict[str, dict] = {
             "presence_penalty": 0.6,  # 여러 기사 인용 시 반복 표현 억제
         },
     },
+    "personalized_teaser": {
+        "tier": ModelTier.HEAVY,
+        "options": {
+            "temperature": 0.6,
+            "num_predict": 550,       # 한글 300자 내외로 자연스럽게 끝나도록 유도
+            "num_ctx": 8192,
+            "presence_penalty": 0.4,
+        },
+    },
+    "extract_keyword": {
+        # 채팅 질문(한국어일 수 있음)을 영어 뉴스 검색용 짧은 키워드로 압축.
+        # 이 프로젝트의 소스가 영어권 전용(hl=en-US&gl=US)이라, 한국어 질문 원문을
+        # 그대로 검색어로 쓰면 결과가 안 나온다 - 반드시 영어로 변환해야 함.
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 24,
+            "num_ctx": 1024,
+            "presence_penalty": 0.0,
+        },
+    },
 }
 
 

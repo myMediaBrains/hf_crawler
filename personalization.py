@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from sqlmodel import Session, select
 
-from models import Article, InteractionSignal
+from models import Article, InteractionSignal, User, TextGeneration
 from personalization_taxonomy import (
     SUBCATEGORY_CONFIG,
     best_subcategory_for_text,
@@ -45,6 +45,7 @@ def classify_and_store(
     signal_type: str = "implicit",
     weight: float = 1.0,
     article_id: int | None = None,
+    user_id: str | None = None,
 ) -> InteractionSignal | None:
     """
     텍스트를 분류해 InteractionSignal로 저장한다.
@@ -59,6 +60,7 @@ def classify_and_store(
     # 매칭 신뢰도는 우선 고정값(0.6)으로 둔다. 향후 LLM 분류로 교체 시
     # personalization_taxonomy에 confidence 반환 로직을 추가하면 된다.
     signal = InteractionSignal(
+        user_id=user_id,
         article_id=article_id,
         source=source,
         subcategory=subcat,
@@ -78,6 +80,7 @@ def store_explicit_feedback(
     session: Session,
     article_id: int,
     positive: bool,
+    user_id: str | None = None,
 ) -> InteractionSignal | None:
     """
     특정 기사에 대한 명시적 피드백(👍/👎)을 저장한다.
@@ -96,6 +99,7 @@ def store_explicit_feedback(
 
     weight = 1.5 if positive else -1.5
     signal = InteractionSignal(
+        user_id=user_id,
         article_id=article_id,
         source="feedback_explicit",
         subcategory=subcat,
@@ -119,15 +123,23 @@ def _decay_factor(created_at_utc: datetime, half_life_days: float) -> float:
     return math.pow(0.5, age_days / half_life_days)
 
 
-def get_profile(session: Session, half_life_days: float = DEFAULT_HALF_LIFE_DAYS) -> dict:
+def get_profile(
+    session: Session,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    user_id: str | None = None,
+) -> dict:
     """
-    전체 InteractionSignal을 시간 가중 감쇠와 함께 집계해 서브카테고리별
-    프로필 점수를 계산한다. (1단계는 멀티유저가 아니므로 user_id 필터 없음)
+    InteractionSignal을 시간 가중 감쇠와 함께 집계해 서브카테고리별
+    프로필 점수를 계산한다. user_id를 넘기면 그 사용자의 신호만 집계하고,
+    넘기지 않으면(None) 등록 전 하위호환을 위해 전체를 집계한다.
 
     반환: {subcategory: {"score": float, "n_signals": int, "top_category": str,
                           "sensitive": bool, "last_signal_kst": str}}
     """
-    rows = session.exec(select(InteractionSignal)).all()
+    stmt = select(InteractionSignal)
+    if user_id is not None:
+        stmt = stmt.where(InteractionSignal.user_id == user_id)
+    rows = session.exec(stmt).all()
 
     profile: dict = {}
     latest_created_at: dict = {}  # subcategory -> datetime(UTC), 내부 계산용
@@ -152,7 +164,55 @@ def get_profile(session: Session, half_life_days: float = DEFAULT_HALF_LIFE_DAYS
     return dict(sorted(profile.items(), key=lambda kv: kv[1]["score"], reverse=True))
 
 
-def get_top_interests(session: Session, n: int = 5, half_life_days: float = DEFAULT_HALF_LIFE_DAYS):
+def get_top_interests(
+    session: Session,
+    n: int = 5,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    user_id: str | None = None,
+):
     """답변 생성 시 시스템 프롬프트에 주입할 상위 관심사 n개."""
-    profile = get_profile(session, half_life_days=half_life_days)
+    profile = get_profile(session, half_life_days=half_life_days, user_id=user_id)
     return list(profile.items())[:n]
+
+
+def register_user_and_backfill(
+    session: Session,
+    user_id: str,
+    display_name: str | None = None,
+) -> dict:
+    """
+    새 사용자를 등록하고, 그동안 user_id가 비어있던(등록 전에 쌓인)
+    InteractionSignal/TextGeneration 행을 전부 이 사용자에게 일괄 귀속시킨다.
+    이미 등록된 user_id면 ValueError를 raise한다 (호출부 main.py에서 409로 변환).
+    """
+    existing = session.exec(select(User).where(User.user_id == user_id)).first()
+    if existing is not None:
+        raise ValueError(f"이미 등록된 사용자 ID입니다: {user_id}")
+
+    user = User(user_id=user_id, display_name=display_name)
+    session.add(user)
+
+    orphan_signals = session.exec(
+        select(InteractionSignal).where(InteractionSignal.user_id.is_(None))
+    ).all()
+    for s in orphan_signals:
+        s.user_id = user_id
+        session.add(s)
+
+    orphan_generations = session.exec(
+        select(TextGeneration).where(TextGeneration.user_id.is_(None))
+    ).all()
+    for g in orphan_generations:
+        g.user_id = user_id
+        session.add(g)
+
+    session.commit()
+    session.refresh(user)
+
+    return {
+        "user_id": user.user_id,
+        "display_name": user.display_name,
+        "backfilled_signals": len(orphan_signals),
+        "backfilled_generations": len(orphan_generations),
+        "created_at_kst": to_kst(user.created_at),
+    }

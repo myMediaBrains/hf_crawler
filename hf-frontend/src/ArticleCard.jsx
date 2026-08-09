@@ -53,6 +53,7 @@ export default function ArticleCard({
     onSaveContent,
     onDeleteArticle,
     onCleanArticle,
+    onExpandArticle,
     MarkdownComponents,
     normalizeParagraphs,
     vaultFolders,
@@ -105,7 +106,7 @@ export default function ArticleCard({
         <div ref={cardRef} className="article-card">
             <div
                 className="article-card-header"
-                onClick={() => dispatch({ type: 'SET_EXPANDED', id: article.id, value: !isExpanded })}
+                onClick={() => onExpandArticle(article)}
                 style={{ cursor: 'pointer' }}
             >
                 <h2 style={{ width: '100%' }}>{article.title}</h2>

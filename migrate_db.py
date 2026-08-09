@@ -114,6 +114,73 @@ def migrate_sources(db_path: str):
 
     conn.close()
 
+INTERACTION_SIGNALS_MIGRATIONS = [
+    ("user_id", "ALTER TABLE interaction_signals ADD COLUMN user_id TEXT"),
+]
+
+TEXT_GENERATIONS_MIGRATIONS = [
+    ("user_id", "ALTER TABLE text_generations ADD COLUMN user_id TEXT"),
+    ("conversation_id", "ALTER TABLE text_generations ADD COLUMN conversation_id TEXT"),
+    ("stage", "ALTER TABLE text_generations ADD COLUMN stage TEXT DEFAULT 'short'"),
+    ("parent_id", "ALTER TABLE text_generations ADD COLUMN parent_id INTEGER"),
+]
+
+
+def migrate_interaction_signals(db_path: str):
+    """interaction_signals 테이블에 user_id 컬럼을 추가한다. 멱등성 보장."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("PRAGMA table_info(interaction_signals)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+    except sqlite3.OperationalError:
+        conn.close()
+        return
+
+    added = []
+    for column_name, sql in INTERACTION_SIGNALS_MIGRATIONS:
+        if column_name not in existing_columns:
+            cursor.execute(sql)
+            added.append(column_name)
+
+    if added:
+        cursor.execute("CREATE INDEX IF NOT EXISTS ix_interaction_signals_user_id ON interaction_signals (user_id)")
+        conn.commit()
+        logger.info(f"[migrate_db] interaction_signals 테이블에 컬럼 추가: {added}")
+    else:
+        logger.info("[migrate_db] interaction_signals 테이블 - 추가할 컬럼 없음 (이미 최신 상태)")
+
+    conn.close()
+
+
+def migrate_text_generations(db_path: str):
+    """text_generations 테이블에 user_id 컬럼을 추가한다. 멱등성 보장."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("PRAGMA table_info(text_generations)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+    except sqlite3.OperationalError:
+        conn.close()
+        return
+
+    added = []
+    for column_name, sql in TEXT_GENERATIONS_MIGRATIONS:
+        if column_name not in existing_columns:
+            cursor.execute(sql)
+            added.append(column_name)
+
+    if added:
+        cursor.execute("CREATE INDEX IF NOT EXISTS ix_text_generations_user_id ON text_generations (user_id)")
+        conn.commit()
+        logger.info(f"[migrate_db] text_generations 테이블에 컬럼 추가: {added}")
+    else:
+        logger.info("[migrate_db] text_generations 테이블 - 추가할 컬럼 없음 (이미 최신 상태)")
+
+    conn.close()
+
 def migrate_keyword_taxonomy(db_name: str) -> None:
     conn = sqlite3.connect(db_name)
     cur = conn.cursor()

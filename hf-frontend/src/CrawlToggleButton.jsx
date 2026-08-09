@@ -27,7 +27,8 @@ export default function CrawlToggleButton() {
       setPaused(data.paused);
       setError(null);
     } catch (e) {
-      setError("상태를 불러오지 못했습니다.");
+      setError("상태를 불러오지 못했습니다. 재시도 중...");
+      setTimeout(fetchStatus, 3000);
     }
   }, []);
 
