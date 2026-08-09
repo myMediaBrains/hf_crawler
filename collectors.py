@@ -27,6 +27,7 @@ from sqlmodel import Session, select
 from models import Article, Source, Keyword, ContentOrigin, SourceOrigin, SourceStatus, BlockedDomain
 from content_utils import clean_article_content, crawl_url_sync, is_crawl_failure, classify_block_reason
 from personalization import classify_and_store
+import tagging
 
 logger = logging.getLogger(__name__)
 
@@ -96,16 +97,13 @@ class RSSCollector(BaseCollector):
                 source=source.name,
                 origin=ContentOrigin.RAW_CRAWL,
             )
-            # 저장 시점에 카테고리를 미리 계산해둔다 (2026-08-09) - 예전엔
-            # /stats/keywords가 매번 기사 전체를 순회하며 재계산해서, 기사가
-            # 쌓일수록(3,600건+ 기준 실측 116초) 점점 느려지는 근본 원인이었다.
-            # main.py는 collectors.py를 import하므로, 반대 방향 import는
-            # 순환참조가 나서 함수 호출 시점에 지연 import한다.
-            from main import _best_category_for_article
-            article.category = _best_category_for_article(article)
-
             session.add(article)
             session.flush()  # commit 전에 article.id를 확보하기 위한 flush
+            # 저장 시점에 다중 태그를 부여한다 (2026-08-09 분류체계 통합 재설계).
+            # 예전엔 main.py를 지연 import해서 카테고리 1개만 계산했는데,
+            # 이제 tagging.py(순환참조 없는 공용 모듈)로 여러 태그를 한 번에 부여한다.
+            tagging.assign_tags_to_article(session, article.id, article.title, article.content or "")
+
             # 고정 RSS 수집 = 사용자가 직접 요청한 게 아니라 백그라운드에서
             # 자동으로 들어온 기사이므로 약한 암묵적 신호(weight=0.3)로 기록한다.
             classify_and_store(
@@ -236,12 +234,10 @@ class GoogleNewsSearchCollector(BaseCollector):
                 keyword=keyword_name,
                 origin=ContentOrigin.RAW_CRAWL,
             )
-            # 저장 시점에 카테고리 미리 계산 (1-1과 동일한 이유)
-            from main import _best_category_for_article
-            article.category = _best_category_for_article(article)
-
             session.add(article)
             session.flush()  # commit 전에 article.id를 확보하기 위한 flush
+            # 저장 시점에 다중 태그를 부여한다 (2-2와 동일한 이유)
+            tagging.assign_tags_to_article(session, article.id, article.title, article.content or "")
 
             # 키워드 검색 수집 = 사용자가 검색창에 직접 입력한 키워드에서 나온 결과이므로
             # RSS 고정 수집보다 더 강한 신호로 취급한다(weight=0.5, signal_type="explicit").
@@ -287,14 +283,20 @@ class GoogleNewsSearchCollector(BaseCollector):
             logger.warning(f"[GoogleNewsSearchCollector] URL 디코딩 중 예외: {google_news_link} ({e})")
         return google_news_link
 
-    @staticmethod
-    def _build_keyword_search_url(keyword: str, months_back: int) -> str:
+   # 지역별 Google 뉴스 로케일. 나중에 일본/중국/스페인/독일 등을 추가할 때
+    # 이 딕셔너리에 항목만 추가하면 된다 (2026-08-09).
+    REGION_LOCALE = {
+        "US": {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+        "KR": {"hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+    }
+    DEFAULT_REGION = "US"
+
+    @classmethod
+    def _build_keyword_search_url(cls, keyword: str, months_back: int, region: str = "US") -> str:
         after_date = (datetime.now() - timedelta(days=30 * months_back)).strftime("%Y-%m-%d")
         query = f"{keyword} after:{after_date}"
-        # hl/gl/ceid을 영어/미국으로 고정 - 한국어 로케일(hl=ko&gl=KR)을 쓰면 구글
-        # 뉴스가 한국어 기사를 우선 반환해서, "원문은 영어"를 전제하는 번역 파이프라인
-        # (영어 문장 -> 한글 문장 대조)이 깨진다 (원문이 이미 한글이라 번역할 영어가 없음).
-        return f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
+        locale = cls.REGION_LOCALE.get(region, cls.REGION_LOCALE[cls.DEFAULT_REGION])
+        return f"https://news.google.com/rss/search?q={quote(query)}&hl={locale['hl']}&gl={locale['gl']}&ceid={locale['ceid']}"
 
     @staticmethod
     def _extract_source(entry, title: str) -> tuple[str, str]:
@@ -352,7 +354,9 @@ class GoogleNewsSearchCollector(BaseCollector):
             session.add(Source(
                 name=display_name,
                 url=block_url,
-                category="BlockList",
+                # category="BlockList" 삭제 (2026-08-09) - 필드 자체가 없어졌고,
+                # 애초에 source_type="blocked"와 중복 정보였다. BlockList 판별은
+                # 이제 source_type 하나로만 한다.
                 source_type="blocked",
                 origin=SourceOrigin.BLOCKED,
                 status=SourceStatus.FAILING,

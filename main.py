@@ -15,7 +15,6 @@ import model_router
 import activity_tracker
 import migrate_db
 import scheduler as scheduler_module
-import taxonomy
 import time
 from content_utils import (
     clean_article_content,
@@ -58,14 +57,15 @@ from database import engine, get_session, create_db_and_tables
 from models import (
     Article, Translation, Keyword, Source, CandidateSource, SchedulerConfig,
     SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin, BlockedDomain,
-    User, TextGeneration, Delivery,
+    User, TextGeneration, Delivery, Tag, TagKeyword, TagBlacklist, ArticleTag, TagRelation,
 )
+import tagging
 
 # 개인화 레이어 import (신규)
 from personalization import (
     classify_and_store, store_explicit_feedback,
     get_profile, get_top_interests,
-    to_kst, register_user_and_backfill,
+    to_kst, register_user_and_backfill, store_tag_preference,
 )
 
 # 환경 변수
@@ -180,6 +180,9 @@ class GenreCreateRequest(BaseModel):
     major_category: str
     mid_category: str
     sub_category: str
+    search_query: str | None = None
+    # 2026-08-09: 분류명(sub_category)과 별개로, 실제 검색에 쓸 자유로운 영어
+    # 문구를 받을 수 있게 함. 없으면 기존처럼 sub_category를 그대로 검색어로 씀.
     months_back: int = 1
     interval_hours: float = 24.0
 
@@ -224,13 +227,13 @@ async def lifespan(app: FastAPI):
     migrate_db.migrate(DB_NAME)
     migrate_db.migrate_sources(DB_NAME)
     migrate_db.migrate_translations(DB_NAME)
-    migrate_db.migrate_keyword_taxonomy(DB_NAME)
     migrate_db.migrate_interaction_signals(DB_NAME)
     migrate_db.migrate_text_generations(DB_NAME)
     logger.info("📊 데이터베이스 테이블이 준비되었습니다.")
 
     scheduler_module.seed_manual_sources(TARGET_SOURCES)
-    taxonomy.seed_taxonomy_keywords()
+    # taxonomy.seed_taxonomy_keywords() 삭제 (2026-08-09) - Tag는 빈 상태로
+    # 시작하기로 결정. 장르편집기/채팅 자동수집으로만 채워진다.
 
     config = scheduler_module.get_or_create_config()
     scheduler.add_job(
@@ -323,21 +326,25 @@ def _unique_vault_filename(folder_path: str, filename: str) -> str:
 # 경계로 본다.
 _SENTENCE_BOUNDARY = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9"\'\(])')
 
+# 2026-08-09: 한글 문장 경계용 - 한글은 대소문자 구분이 없어서 영어용 패턴의
+# "다음 글자가 대문자/숫자"라는 조건이 무의미하다. 구두점 뒤 공백만으로 판단.
+_SENTENCE_BOUNDARY_KO = re.compile(r'(?<=[.!?])\s+')
+
 # 이미지/링크 단독 줄(![alt](url) 또는 [text](url)만 있는 줄) 감지용
 _STANDALONE_LINK_LINE = re.compile(r'^!?\[.*?\]\(.*?\)$')
 
 
-def _split_paragraph_into_sentences(paragraph: str) -> list[str]:
+def _split_paragraph_into_sentences(paragraph: str, source_lang: str = "en") -> list[str]:
     """빈 줄 없는 문단 하나를 문장 단위로 쪼갠다."""
     paragraph = paragraph.strip()
     if not paragraph:
         return []
-    parts = _SENTENCE_BOUNDARY.split(paragraph)
+    boundary = _SENTENCE_BOUNDARY_KO if source_lang == "ko" else _SENTENCE_BOUNDARY
+    parts = boundary.split(paragraph)
     return [p.strip() for p in parts if p.strip()]
 
 
-def _segment_article_for_translation(content: str) -> list[dict]:
-    """
+def _segment_article_for_translation(content: str, source_lang: str = "en") -> list[dict]:    """
     기사 본문을 번역 파이프라인이 순서대로 처리할 세그먼트 목록으로 쪼갠다.
     각 세그먼트: {"type": "translate" | "verbatim", "text": str, "paragraph_end": bool}
 
@@ -366,7 +373,7 @@ def _segment_article_for_translation(content: str) -> list[dict]:
         paragraph_buffer.clear()
         if not text:
             return
-        sentences = _split_paragraph_into_sentences(text)
+        sentences = _split_paragraph_into_sentences(text, source_lang=source_lang)
         for i, sentence in enumerate(sentences):
             segments.append({
                 "type": "translate",
@@ -402,12 +409,36 @@ def _segment_article_for_translation(content: str) -> list[dict]:
     return segments
 
 
-def _build_sentence_translation_system_prompt(mode: str) -> str:
+def _build_sentence_translation_system_prompt(mode: str, source_lang: str = "en") -> str:
     """
-    문장 하나만 번역시키는 시스템 프롬프트. 영어 원문 재출력을 요구하지 않으므로
-    (그건 이제 파이썬이 담당) 모델이 지켜야 할 지시가 단순해서 훨씬 안정적으로
-    따른다.
+    문장 하나만 번역시키는 시스템 프롬프트. 원문 재출력을 요구하지 않으므로
+    (그건 파이썬이 담당) 모델이 지켜야 할 지시가 단순해서 훨씬 안정적으로 따른다.
+
+    2026-08-09: source_lang="ko"면 한→영 방향으로 뒤집는다 (번역 버튼 양방향화).
     """
+    if source_lang == "ko":
+        mode_instruction = (
+            "Provide a strict, literal translation into English, preserving Korean "
+            "sentence structure as much as possible (직역)."
+            if mode == "literal"
+            else "Provide a natural, fluent English translation (의역)."
+        )
+        return (
+            "You are an expert Korean-to-English translator. "
+            "You will be given exactly ONE Korean sentence or line (it may include markdown "
+            "syntax such as a '#' header marker, a '-' or '*' list marker, or [text](url) "
+            "link syntax).\n\n"
+            "Output ONLY the English translation of that sentence — nothing else. "
+            "Do NOT repeat or quote the Korean sentence. Do NOT add any preamble, notes, "
+            "or explanation of what you translated. Do NOT wrap the output in quotes.\n"
+            "If the source starts with a markdown marker (#, -, *), keep that same marker "
+            "at the start of your English output. If the source contains a [text](url) link, "
+            "translate only the visible text portion and keep the (url) exactly as-is.\n"
+            "Do NOT translate proper nouns, company names, product/brand names, trademarks, "
+            "inline code, or URLs — keep those in their original form.\n"
+            f"Translation style: {mode_instruction}"
+        )
+
     mode_instruction = (
         "Provide a strict, literal translation (직역) into Korean, preserving English word order as much as possible."
         if mode == "literal"
@@ -598,7 +629,13 @@ def submit_feedback(request: ExplicitFeedbackRequest, session: Session = Depends
     )
     if signal is None:
         raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없거나 분류할 수 없습니다.")
-    return {"status": "success", "subcategory": signal.subcategory, "weight": signal.weight}
+    # 2026-08-09: InteractionSignal.subcategory(삭제됨) 대신 major_category/tag_id 반환
+    return {
+        "status": "success",
+        "tag_id": signal.tag_id,
+        "major_category": signal.major_category,
+        "weight": signal.weight,
+    }
 
 
 @app.get("/personalization/profile")
@@ -693,9 +730,15 @@ def study_translate_article(
         raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없습니다.")
 
     mode = request.mode
-    task = "translate_sentence_literal" if mode == "literal" else "translate_sentence_natural"
-    system_prompt = _build_sentence_translation_system_prompt(mode)
-    segments = _segment_article_for_translation(article.content)
+    # 2026-08-09: 번역 버튼 양방향화 - 원문 언어를 감지해서 방향을 정한다.
+    # 한글이 있으면 한국어 원문으로 보고 한→영, 없으면 기존처럼 영→한.
+    source_lang = "ko" if tagging._contains_hangul(article.content or "") else "en"
+    if source_lang == "ko":
+        task = "translate_sentence_literal_ko_en" if mode == "literal" else "translate_sentence_natural_ko_en"
+    else:
+        task = "translate_sentence_literal" if mode == "literal" else "translate_sentence_natural"
+    system_prompt = _build_sentence_translation_system_prompt(mode, source_lang=source_lang)
+    segments = _segment_article_for_translation(article.content, source_lang=source_lang)
 
     parts: list[str] = []
     try:
@@ -728,6 +771,7 @@ def study_translate_article(
         "status": "success",
         "article_id": article_id,
         "mode": mode,
+        "source_lang": source_lang,
         "translated_content": translated_content
     }
 
@@ -746,9 +790,15 @@ async def study_translate_article_stream(
     if not article:
         raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없습니다.")
 
-    task = "translate_sentence_literal" if mode == "literal" else "translate_sentence_natural"
-    system_prompt = _build_sentence_translation_system_prompt(mode)
-    segments = _segment_article_for_translation(article.content)
+    # 2026-08-09: 번역 버튼 양방향화 - 동기 엔드포인트(study_translate_article)와
+    # 동일한 언어 감지 로직.
+    ssource_lang = "ko" if tagging._contains_hangul(article.content or "") else "en"
+    if source_lang == "ko":
+        task = "translate_sentence_literal_ko_en" if mode == "literal" else "translate_sentence_natural_ko_en"
+    else:
+        task = "translate_sentence_literal" if mode == "literal" else "translate_sentence_natural"
+    system_prompt = _build_sentence_translation_system_prompt(mode, source_lang=source_lang)
+    segments = _segment_article_for_translation(article.content, source_lang=source_lang)
     total_units = sum(1 for s in segments if s["type"] == "translate") or 1
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -882,29 +932,42 @@ def _collect_single_keyword(
     interval_hours: float = 24.0,
     max_entries: int = 20,
     register: bool = True,
+    major_category: str | None = None,
+    search_query: str | None = None,
+    region: str | None = None,
 ) -> dict:
     """
     검색창에 입력된 키워드 하나만 즉시 강제 수집한다 (due 체크 무시, 다른
-    소스/키워드는 절대 건드리지 않는다). "파이프라인 수집" 버튼에 검색어가
-    들어있을 때 이 함수가 호출된다.
+    소스/키워드는 절대 건드리지 않는다).
 
-    register=True(기본값, 사람이 직접 검색창에 입력한 경우): 아직 등록되지
-    않은 키워드면 여기서 자동으로 영구 등록한 뒤 바로 수집한다 ("검색/등록"을
-    따로 먼저 눌러야만 하는 불편함을 없애기 위함 - 8/7 세션에서 사용자 피드백으로
-    반영됨).
-
-    register=False(채팅 자동수집 전용, 2026-08-09 추가): DB에 Keyword 행을
-    남기지 않고 이번 한 번만 수집한다. 채팅에서 "근거 부족"으로 판단될 때마다
-    호출되는데, register=True로 두면 사용자가 검색창에 입력한 적도 없는
-    키워드(심지어 채팅 질문 원문 그대로)가 스케줄러에 영구 등록되어 매일
-    반복 수집되는 문제가 있었다 - 등록된 키워드가 많아질수록 스케줄러 틱마다
-    처리할 일이 계속 늘어나 백그라운드 부하가 누적되는 근본 원인이었다.
+    2026-08-09 검색 지역 강제: region이 명시되면 입력 언어와 무관하게 그
+    지역 언어로 검색어를 강제 변환한다 (예: 영어 입력이어도 region="KR"이면
+    한글로 번역해서 한국 사이트를 검색). region 없으면(자동) 입력 언어를
+    그대로 따른다. Keyword.name(분류용)은 지역/검색언어와 무관하게 항상
+    영어로 통일한다 (tagging.get_or_create_tag가 보장).
     """
-    keyword = session.exec(select(Keyword).where(Keyword.name == keyword_name)).first()
+    base_query_text = search_query or keyword_name
+    resolved_query, language = _resolve_search_query_and_language(base_query_text, region)
+    search_query = resolved_query
+
+    canonical_name = (
+        tagging._translate_to_english_tag_name(keyword_name)
+        if tagging._contains_hangul(keyword_name) else keyword_name
+    )
+
+    keyword = session.exec(select(Keyword).where(Keyword.name == canonical_name)).first()
     auto_registered = False
     if not keyword:
+        tag_id = None
+        if major_category:
+            tag = tagging.get_or_create_tag(session, name=canonical_name, major_category=major_category)
+            tag_id = tag.id
+
         keyword = Keyword(
-            name=keyword_name,
+            name=canonical_name,
+            tag_id=tag_id,
+            search_query=search_query,
+            language=language,
             months_back=months_back,
             interval_hours=interval_hours,
         )
@@ -913,9 +976,9 @@ def _collect_single_keyword(
             session.commit()
             session.refresh(keyword)
             auto_registered = True
-            logger.info(f"[collect] '{keyword_name}' 키워드 자동 등록 (파이프라인 수집에서)")
+            logger.info(f"[collect] '{canonical_name}' 키워드 자동 등록 (언어: {language})")
         else:
-            logger.info(f"[collect] '{keyword_name}' 일회성 수집 (영구 등록 안 함)")
+            logger.info(f"[collect] '{canonical_name}' 일회성 수집 (영구 등록 안 함)")
 
     collector = COLLECTOR_REGISTRY["google_news_search"]
     if not job_control.start_job_with_priority(f"키워드 수집: {keyword.name}"):
@@ -955,6 +1018,39 @@ def _collect_single_keyword(
         "message": message
     }
 
+def _translate_text_llm(task: str, text: str) -> str:
+    """범용 번역 헬퍼 - 실패하면 원문을 그대로 반환."""
+    prompt = f"다음 문구를 번역해줘. 번역 결과만 출력하고 다른 설명은 붙이지 마: \"{text}\""
+    try:
+        raw = model_router.chat(task, [{"role": "user", "content": prompt}])
+        return raw.strip().strip('"').strip("'") or text
+    except Exception as e:
+        logger.warning(f"[collect] 번역 실패({task}), 원문 유지: {e}")
+        return text
+
+
+def _resolve_search_query_and_language(text: str, region: str | None) -> tuple[str, str]:
+    """
+    2026-08-09: 검색 지역(region)에 맞춰 검색어의 실제 언어를 강제한다.
+    region이 None이면(자동) 입력 텍스트의 언어를 그대로 따른다. region="US"/"KR"이
+    명시되면 입력 언어와 무관하게 그 지역 언어로 강제 번역한다 (나중에 JP/CN/ES/DE
+    추가는 이 함수 분기만 늘리면 됨).
+    """
+    is_korean_input = tagging._contains_hangul(text)
+
+    if region is None:
+        return text, ("ko" if is_korean_input else "en")
+
+    if region == "KR":
+        if is_korean_input:
+            return text, "ko"
+        return _translate_text_llm("translate_keyword_ko", text), "ko"
+
+    # region == "US" (그 외 미지원 값도 일단 영어권으로 폴백)
+    if not is_korean_input:
+        return text, "en"
+    return _translate_text_llm("translate_keyword_en", text), "en"
+
 
 # 3. 수집 실행 API - keyword 파라미터가 있으면 그 키워드만(없으면 자동 등록), 없으면 전체 소스/키워드 점검
 @app.get("/collect/deep-incremental")
@@ -963,10 +1059,17 @@ def collect_deep_incremental(
     months_back: int = Query(1),
     interval_hours: float = Query(24.0),
     max_entries: int = Query(20),
+    register: bool = Query(True),
+    major_category: str | None = Query(None),
+    search_query: str | None = Query(None),
+    region: str | None = Query(None),
     session: Session = Depends(get_session),
 ):
     if keyword and keyword.strip():
-        return _collect_single_keyword(keyword.strip(), session, months_back, interval_hours, max_entries)
+        return _collect_single_keyword(
+            keyword.strip(), session, months_back, interval_hours, max_entries, register,
+            major_category=major_category, search_query=search_query, region=region,
+        )
 
     stats = scheduler_module.run_tick()
     total = stats["sources_new_articles"] + stats["keywords_new_articles"]
@@ -1147,9 +1250,6 @@ def delete_keyword(keyword_id: int, session: Session = Depends(get_session)):
     }
 
 # 3-1-5. 장르(대분류/중분류/소분류) 등록 - '장르 편집기' 버튼 전용.
-# 소분류(sub_category)가 실제 Keyword.name(백그라운드 검색어)이 되고,
-# 대분류/중분류는 taxonomy 그룹핑용 메타데이터로 저장된다. 이미 같은 이름의
-# 키워드가 있으면(예: taxonomy.py로 미리 시딩된 경우) 분류만 갱신한다.
 @app.post("/genres")
 def create_genre(request: GenreCreateRequest, session: Session = Depends(get_session)):
     major = request.major_category.strip()
@@ -1159,21 +1259,31 @@ def create_genre(request: GenreCreateRequest, session: Session = Depends(get_ses
     if not major or not mid or not sub:
         raise HTTPException(status_code=400, detail="대분류/중분류/소분류를 모두 입력해주세요.")
 
-    existing = session.exec(select(Keyword).where(Keyword.name == sub)).first()
+    # 2026-08-09: 분류는 이제 Tag가 담당. Keyword는 tag_id로 연결만 한다.
+    tag = tagging.get_or_create_tag(session, name=sub, major_category=major, mid_category=mid)
+    # 2026-08-09: sub가 한글이었다면 tag.name은 이미 영어로 번역된 상태다.
+    # Keyword.name도 원문(sub)이 아니라 이 tag.name으로 통일해야, 태그는
+    # 영어인데 키워드 이름만 한글로 남는 불일치가 안 생긴다. 검색 자체는
+    # 여전히 한글 원문으로 해야 하므로, search_query가 명시 안 됐고 원문이
+    # 한글이면 원문을 검색어로 폴백시킨다.
+    was_korean = tagging._contains_hangul(sub)
+    final_search_query = request.search_query or (sub if was_korean else None)
+
+    existing = session.exec(select(Keyword).where(Keyword.name == tag.name)).first()
     if existing:
-        existing.major_category = major
-        existing.mid_category = mid
+        existing.tag_id = tag.id
         session.add(existing)
         session.commit()
         return {
             "status": "success",
-            "message": f"이미 있던 '{sub}' 키워드의 분류를 '{major} > {mid}'로 갱신했습니다."
+            "message": f"이미 있던 '{tag.name}' 키워드의 분류를 '{major} > {mid}'로 갱신했습니다."
         }
 
     keyword = Keyword(
-        name=sub,
-        major_category=major,
-        mid_category=mid,
+        name=tag.name,
+        tag_id=tag.id,
+        search_query=final_search_query,
+        language="ko" if was_korean else "en",
         months_back=request.months_back,
         interval_hours=request.interval_hours,
     )
@@ -1193,10 +1303,11 @@ def list_genres(session: Session = Depends(get_session)):
 
     for k in keywords:
         article_count = len(session.exec(select(Article).where(Article.keyword == k.name)).all())
+        tag = session.get(Tag, k.tag_id) if k.tag_id else None
         result.append({
             "id": k.id,
-            "major_category": k.major_category or "미분류",
-            "mid_category": k.mid_category or "-",
+            "major_category": tag.major_category if tag else "미분류",
+            "mid_category": (tag.mid_category or "-") if tag else "-",
             "sub_category": k.name,
             "article_count": article_count,
             "interval_hours": k.interval_hours,
@@ -1205,6 +1316,61 @@ def list_genres(session: Session = Depends(get_session)):
     result.sort(key=lambda x: (x["major_category"], x["mid_category"], x["sub_category"]))
     return {"genres": result}
 
+class GenreSelectItem(BaseModel):
+    major_category: str
+    mid_category: str
+    sub_category: str
+    search_query: str | None = None
+
+
+class GenreSelectRequest(BaseModel):
+    items: list[GenreSelectItem]
+    user_id: str | None = None
+
+
+@app.post("/genres/select")
+def select_preferred_genres(request: GenreSelectRequest, session: Session = Depends(get_session)):
+    """
+    '선호 장르 선택' 패널에서 체크한 항목들을 한 번에 등록 + 선호 신호로 기록한다.
+    """
+    registered, preferred = 0, 0
+    for item in request.items:
+        major = item.major_category.strip()
+        mid = item.mid_category.strip()
+        sub = item.sub_category.strip()
+        if not major or not mid or not sub:
+            continue
+
+        tag = tagging.get_or_create_tag(session, name=sub, major_category=major, mid_category=mid)
+        was_korean = tagging._contains_hangul(sub)
+        final_search_query = item.search_query or (sub if was_korean else None)
+
+        existing = session.exec(select(Keyword).where(Keyword.name == tag.name)).first()
+        if existing:
+            existing.tag_id = tag.id
+            session.add(existing)
+        else:
+            keyword = Keyword(
+                name=tag.name,
+                tag_id=tag.id,
+                search_query=final_search_query,
+                language="ko" if was_korean else "en",
+                months_back=1,
+                interval_hours=24.0,
+            )
+            session.add(keyword)
+        session.commit()
+        registered += 1
+
+        store_tag_preference(session, tag_id=tag.id, user_id=request.user_id)
+        preferred += 1
+
+    return {
+        "status": "success",
+        "registered": registered,
+        "preferred": preferred,
+        "message": f"{registered}개 장르를 등록하고 선호 신호로 기록했습니다.",
+    }
 
 # 3-2. 키워드 목록 조회 - 키워드 관리 패널(전체 보기)에서 쓸 통계(건수/게시일 범위) 포함
 @app.get("/keywords")
@@ -1245,32 +1411,44 @@ def list_keywords(session: Session = Depends(get_session)):
 @app.get("/sources")
 def list_sources(session: Session = Depends(get_session)):
     sources = session.exec(select(Source).order_by(Source.id.desc())).all()
-    return {
-        "sources": [
-            {
-                "id": s.id,
-                "name": s.name,
-                "url": s.url,
-                "category": s.category,
-                "source_type": s.source_type,
-                "origin": s.origin,
-                "status": s.status,
-                "interval_hours": s.interval_hours,
-                "fail_count": s.fail_count,
-                "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
-                "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
-                "block_reason": s.block_reason,
-            }
-            for s in sources
-        ]
-    }
+
+    # tag_id -> Tag 캐시 (소스마다 개별 쿼리 하지 않도록)
+    tag_cache: dict[int, Tag] = {}
+
+    def _tag_for(tag_id):
+        if tag_id is None:
+            return None
+        if tag_id not in tag_cache:
+            tag_cache[tag_id] = session.get(Tag, tag_id)
+        return tag_cache[tag_id]
+
+    result = []
+    for s in sources:
+        tag = _tag_for(s.tag_id)
+        result.append({
+            "id": s.id,
+            "name": s.name,
+            "url": s.url,
+            "major_category": tag.major_category if tag else None,
+            # 2026-08-09: category(문자열) 대신 tag_id로 조인한 major_category.
+            "sensitive": tag.sensitive if tag else False,
+            "source_type": s.source_type,
+            "origin": s.origin,
+            "status": s.status,
+            "interval_hours": s.interval_hours,
+            "fail_count": s.fail_count,
+            "last_success_at": s.last_success_at.isoformat() if s.last_success_at else None,
+            "last_attempt_at": s.last_attempt_at.isoformat() if s.last_attempt_at else None,
+            "block_reason": s.block_reason,
+        })
+    return {"sources": result}
 
 @app.get("/sources/evaluation")
 def evaluate_sources(session: Session = Depends(get_session)):
     """
     '출처 평가' 버튼 전용 엔드포인트.
-    카테고리(Source.category)별로 소스를 묶어서, 각 소스의 건수/점수/순위를
-    계산해 반환한다. 블록리스트(source_type="blocked")는 평가 대상에서 제외한다.
+    2026-08-09: Source.category(문자열) 대신 tag_id로 조인한 major_category별로
+    묶는다. 블록리스트(source_type="blocked")는 평가 대상에서 제외한다.
     """
     sources = session.exec(
         select(Source).where(Source.source_type != "blocked")
@@ -1294,7 +1472,8 @@ def evaluate_sources(session: Session = Depends(get_session)):
             avg_content_length=avg_length,
         )
 
-        category = s.category or "미분류"
+        tag = session.get(Tag, s.tag_id) if s.tag_id else None
+        category = tag.major_category if tag else "미분류"
         categories.setdefault(category, []).append({
             "id": s.id,
             "name": s.name,
@@ -1318,7 +1497,6 @@ def evaluate_sources(session: Session = Depends(get_session)):
             "sources": ranked,
         })
 
-    # 소스 개수 많은 카테고리(=관심도/활동량 높은 분야)를 위로 정렬
     result.sort(key=lambda c: c["source_count"], reverse=True)
 
     return {"categories": result}
@@ -1331,10 +1509,20 @@ def create_source(request: SourceCreateRequest, session: Session = Depends(get_s
     if existing:
         raise HTTPException(status_code=400, detail="이미 등록된 URL입니다.")
 
+    # 2026-08-09: Source.category(문자열) 필드가 삭제되고 tag_id(FK)로 대체됐다.
+    # 이 엔드포인트에서 이걸 놓쳐서 존재하지 않는 필드에 값을 넣으려다
+    # TypeError가 나는 버그가 있었다.
+    tag_id = None
+    if request.category and request.category.strip():
+        tag = tagging.get_or_create_tag(
+            session, name=request.category.strip(), major_category=request.category.strip()
+        )
+        tag_id = tag.id
+
     source = Source(
         name=request.name,
         url=request.url,
-        category=request.category,
+        tag_id=tag_id,
         source_type=request.source_type,
         origin=SourceOrigin.MANUAL_ADDED,
         interval_hours=request.interval_hours,
@@ -1707,18 +1895,13 @@ def get_keyword_stats(session: Session = Depends(get_session)):
     if _keyword_stats_cache["data"] is not None and (now - _keyword_stats_cache["computed_at"]) < _KEYWORD_STATS_CACHE_TTL:
         return _keyword_stats_cache["data"]
 
-    # 카테고리별 건수 - 저장 시점에 미리 계산해둔 Article.category를 SQL
-    # GROUP BY로 집계한다 (2026-08-09, 근본 해결). 예전엔 기사 전체를 매번
-    # 파이썬으로 순회하며 정규식 재매칭했는데, 3,600건 기준 실측 116초가
-    # 걸렸던 게 이 방식으로는 수 밀리초로 끝난다.
-    # ⚠️ 기존에 저장된 기사는 category가 비어있으므로, 반영 즉시는 값이
-    # 비어보일 수 있다 - /admin/backfill-categories를 한 번 호출해서 채워야 함.
-    category_counts = session.exec(
-        select(Article.category, sql_func.count(Article.id))
-        .where(Article.category.is_not(None))
-        .group_by(Article.category)
+    # 2026-08-09: Article.category(단일값) 대신 ArticleTag(다중값)로 집계.
+    tag_counts = session.exec(
+        select(Tag.name, sql_func.count(ArticleTag.id))
+        .join(ArticleTag, ArticleTag.tag_id == Tag.id)
+        .group_by(Tag.name)
     ).all()
-    filtered_stats = {cat: cnt for cat, cnt in category_counts if cat}
+    filtered_stats = {name: cnt for name, cnt in tag_counts if name}
 
     registered_counts = session.exec(
         select(Article.keyword, sql_func.count(Article.id))
@@ -1733,30 +1916,6 @@ def get_keyword_stats(session: Session = Depends(get_session)):
     _keyword_stats_cache["data"] = result
     _keyword_stats_cache["computed_at"] = now
     return result
-
-@app.post("/admin/backfill-categories")
-def backfill_article_categories(session: Session = Depends(get_session)):
-    """
-    일회성 관리 작업 - category가 비어있는 기존 기사들에 카테고리를 채운다.
-    이번 패치 적용 후 딱 한 번만 호출하면 됨 (그 이후 기사는 저장 시점에
-    자동으로 채워지므로 다시 돌릴 필요 없음). 기사가 많으면 시간이 걸릴 수
-    있으니 오래 걸려도 정상이다.
-    """
-    articles = session.exec(select(Article).where(Article.category.is_(None))).all()
-    updated = 0
-    for article in articles:
-        category = _best_category_for_article(article)
-        if category:
-            article.category = category
-            session.add(article)
-            updated += 1
-        if updated % 200 == 0 and updated > 0:
-            session.commit()  # 오래 걸려도 DB 잠금을 짧게 나눠서 유지
-    session.commit()
-    return {
-        "status": "success",
-        "message": f"기존 기사 {len(articles)}건 중 {updated}건에 카테고리를 채웠습니다."
-    }
 
 
 # 10. 아티클 목록 조회 API
@@ -1807,17 +1966,22 @@ def get_articles(
         # 일치하면 /stats/keywords와 완전히 동일한 점수제 판정으로 필터링한다.
         # (건수와 목록이 항상 같은 숫자를 가리키도록 보장하는 부분)
         clean_kw_lower = clean_kw.lower()
-        matched_category = None
-        for cat, config in CATEGORY_CONFIG.items():
-            if clean_kw_lower == cat.lower() or clean_kw_lower in [s.lower() for s in config["keywords"]]:
-                matched_category = cat
-                break
+        matched_tag = session.exec(
+            select(Tag).where(
+                (sql_func.lower(Tag.name) == clean_kw_lower)
+                | (sql_func.lower(Tag.major_category) == clean_kw_lower)
+            )
+        ).first()
 
-        if matched_category:
-            query = select(Article).where(Article.category == matched_category).order_by(Article.id.desc())
+        if matched_tag:
+            query = (
+                select(Article)
+                .join(ArticleTag, ArticleTag.article_id == Article.id)
+                .where(ArticleTag.tag_id == matched_tag.id)
+                .order_by(Article.id.desc())
+            )
             articles = session.exec(query).all()
         else:
-            # 어떤 고정 카테고리에도 안 걸리는 임의의 검색어 - 기존처럼 단순 텍스트 포함 검색으로 폴백
             query = select(Article).where(
                 (Article.title.contains(clean_kw)) | (Article.content.contains(clean_kw))
             ).order_by(Article.id.desc())
@@ -1909,12 +2073,30 @@ if __name__ == "__main__":
 @app.post("/scheduler/pause")
 def pause_scheduler():
     job_control.pause_collection()
-    return {"status": "success", "message": "백그라운드 수집이 일시정지되었습니다."}
+    # 2026-08-09: 일시정지는 "다음 틱부터 건너뛰기"만 하고, 지금 이미 진행
+    # 중인 틱은 안 멈췄다 - "중지 눌렀는데 계속 도는 것 같다"는 증상의 원인.
+    # 지금 도는 게 백그라운드 틱이면 취소 신호도 같이 보내서, 다음 소스/키워드로
+    # 넘어가기 직전(안전한 지점)에 최대한 빨리 멈추게 한다.
+    cancelled_job = None
+    if job_control.current_job() == job_control.BACKGROUND_TICK_JOB_NAME:
+        cancelled_job = job_control.cancel_current_job()
+
+    message = "백그라운드 수집이 일시정지되었습니다."
+    if cancelled_job:
+        message += " 지금 진행 중이던 점검에도 중단 신호를 보냈습니다 (완전히 멈추기까지 수 초~수십 초 걸릴 수 있습니다)."
+    return {"status": "success", "message": message}
 
 @app.post("/scheduler/resume")
 def resume_scheduler():
     job_control.resume_collection()
-    return {"status": "success", "message": "백그라운드 수집이 재개되었습니다."}
+    # 2026-08-09: 재개 버튼이 실제로는 "다음 틱부터 건너뛰지 않기"만 할 뿐,
+    # 즉시 수집을 시작시키진 않았다. 스케줄러 틱은 30분 간격이라, 재개를
+    # 누른 시점이 주기 중간이면 최대 30분간 "가만히 있는 것처럼" 보이는
+    # 문제가 있었다 - 재개 즉시 한 번 틱을 백그라운드로 돌려서 바로 체감되게 한다.
+    threading.Thread(
+        target=scheduler_module.run_tick, daemon=True, name="resume-immediate-tick"
+    ).start()
+    return {"status": "success", "message": "백그라운드 수집이 재개되었습니다. 즉시 1회 점검을 시작합니다."}
 
 # 백그라운드 크롤링 일시정지 상태 조회
 @app.get("/scheduler/status")

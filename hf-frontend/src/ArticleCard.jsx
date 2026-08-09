@@ -3,9 +3,10 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import MarkdownEditor from './MarkdownEditor';
 
-// 번역 결과(영어 문장 -> 한글 문장이 줄 단위로 번갈아 나오는 포맷)에서
-// 한글 문장만 걸러낸다. 코드블록(```)과 빈 줄은 구조 보존을 위해 그대로 둔다.
-function extractKoreanOnly(text) {
+// 2026-08-09: 번역 버튼 양방향화 - wantKorean=true면 한글 줄만(기존 동작,
+// 영→한 기사의 "한글보기"), false면 한글이 "없는" 줄만 남긴다(한→영 기사의
+// "영어보기" - 번역된 영어 문장만 보여주고 한글 원문은 숨김).
+function extractByLanguage(text, wantKorean) {
     if (!text) return '';
 
     const lines = text.split('\n');
@@ -25,13 +26,12 @@ function extractKoreanOnly(text) {
             continue;
         }
 
-        // 한글(완성형 음절)이 하나라도 포함된 줄만 남긴다 - 영어 원문 줄은 제거.
-        if (/[\uAC00-\uD7A3]/.test(line)) {
+        const hasKorean = /[\uAC00-\uD7A3]/.test(line);
+        if (wantKorean ? hasKorean : !hasKorean) {
             kept.push(line);
         }
     }
 
-    // 영어 줄을 제거하고 나면 빈 줄이 3개 이상 겹칠 수 있으므로 문단 간격만 남기고 정리.
     return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
@@ -136,11 +136,14 @@ export default function ArticleCard({
                         </button>
                         {translatedContent && !isTranslating && !translatedContent.startsWith('❌') && (
                             <button
-                                onClick={() => onToggleKoreanOnly(article.id)}
-                                style={{ backgroundColor: showKoreanOnly ? '#b45309' : '#f59e0b', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 'bold' }}
-                            >
-                                {showKoreanOnly ? '🌐 영/한 대조 보기' : '🇰🇷 한글보기'}
-                            </button>
+                            onClick={() => onToggleKoreanOnly(article.id)}
+                            style={{ backgroundColor: showKoreanOnly ? '#b45309' : '#f59e0b', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 'bold' }}
+                        >
+                            {/* 2026-08-09: 원문이 한글 기사면(번역 버튼 양방향화) "영어보기"로 라벨 전환 */}
+                            {showKoreanOnly
+                                ? '🌐 원문/번역 대조 보기'
+                                : /[\uAC00-\uD7A3]/.test(article.content || '') ? '🇺🇸 영어보기' : '🇰🇷 한글보기'}
+                        </button>
                         )}
                         <button
                             onClick={() => onToggleEdit(article)}
@@ -235,7 +238,14 @@ export default function ArticleCard({
                         <div className="article-content-preview">
                             <ReactMarkdown remarkPlugins={[remarkGfm]} components={MarkdownComponents}>
                                 {showKoreanOnly && translatedContent
-                                    ? normalizeParagraphs(extractKoreanOnly(translatedContent))
+                                    ? normalizeParagraphs(
+                                        extractByLanguage(
+                                            translatedContent,
+                                            !/[\uAC00-\uD7A3]/.test(article.content || '')
+                                            // 원문이 영어 기사면(true) 한글 줄만 남기고,
+                                            // 원문이 한글 기사면(false) 영어 줄만 남긴다.
+                                        )
+                                    )
                                     : showTranslation && translatedContent
                                         ? normalizeParagraphs(translatedContent)
                                         : normalizeParagraphs(article.content)}

@@ -124,6 +124,27 @@ TASK_PROFILES: dict[str, dict] = {
             "presence_penalty": 0.4,
         },
     },
+    "translate_sentence_literal_ko_en": {
+        # 2026-08-09: 번역 버튼 양방향화 - 한글 원문 기사를 영어로 번역할 때 사용.
+        # 기존 영→한 프로필과 옵션은 동일, task 이름만 분리해서 model_used
+        # 이력 기록 시 방향을 구분할 수 있게 했다.
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 256,
+            "num_ctx": 1024,
+            "presence_penalty": 0.2,
+        },
+    },
+    "translate_sentence_natural_ko_en": {
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 256,
+            "num_ctx": 1024,
+            "presence_penalty": 0.4,
+        },
+    },
     "classify": {
         "tier": ModelTier.LIGHT,
         "options": {
@@ -167,6 +188,18 @@ TASK_PROFILES: dict[str, dict] = {
             "num_predict": 550,       # 한글 300자 내외로 자연스럽게 끝나도록 유도
             "num_ctx": 8192,
             "presence_penalty": 0.4,
+        },
+    },
+    "propose_taxonomy": {
+        # 채팅 자동수집이 새 키워드를 만들 때, 대분류/중분류/검색문구를 한 번에
+        # 생성. 대분류는 프롬프트에서 "기존 목록 중에서 고르라"고 강하게 유도해서
+        # Tag가 무한정 늘어나는 걸 막는다.
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 100,
+            "num_ctx": 1024,
+            "presence_penalty": 0.0,
         },
     },
     "extract_keyword": {

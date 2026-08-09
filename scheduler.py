@@ -24,6 +24,7 @@ from models import (
 )
 from collectors import COLLECTOR_REGISTRY
 import activity_tracker
+import tagging
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +61,18 @@ def seed_manual_sources(target_sources: list[dict]):
             if name.startswith("[") and "]" in name:
                 category = name[1:name.index("]")]
 
+            # 2026-08-09: Source.category(문자열) 필드가 삭제되고 tag_id(FK)로
+            # 대체됐다. 이름 앞 "[대괄호]"로 파싱한 카테고리는 이제 Tag로 만들어
+            # 연결한다.
+            tag_id = None
+            if category:
+                tag = tagging.get_or_create_tag(session, name=category, major_category=category)
+                tag_id = tag.id
+
             session.add(Source(
                 name=name,
                 url=item["url"],
-                category=category,
+                tag_id=tag_id,
                 source_type="rss",
                 origin=SourceOrigin.MANUAL,
                 interval_hours=3.0,
@@ -266,8 +275,6 @@ def _track_candidates(session: Session, keyword: Keyword, discovered: list[tuple
 
 def _promote_candidate(session: Session, keyword: Keyword, candidate: CandidateSource):
     """후보 출처를 Source 테이블에 고정 소스로 승격한다 (origin=auto_promoted)."""
-    # collectors.py의 _build_keyword_search_url()과 동일한 이유로 영어/미국 로케일 사용
-    # (한국어 로케일이면 승격된 소스도 한국어 기사를 계속 수집하게 됨).
     query_url = (
         f"https://news.google.com/rss/search?q={quote(keyword.name)}+site:{candidate.domain}"
         f"&hl=en-US&gl=US&ceid=US:en"
@@ -280,9 +287,9 @@ def _promote_candidate(session: Session, keyword: Keyword, candidate: CandidateS
     session.add(Source(
         name=f"[{keyword.name}] {candidate.source_name}",
         url=query_url,
-        category=keyword.major_category or keyword.name,
-        # major_category가 있으면(taxonomy 시딩 키워드) 대분류로 묶고,
-        # 없으면(예전 방식 수동 키워드) 기존처럼 키워드 이름 자체를 카테고리로 유지.
+        tag_id=keyword.tag_id,
+        # 2026-08-09: category(문자열) 대신 keyword.tag_id를 그대로 물려받는다 -
+        # 원본 키워드가 이미 Tag에 연결돼 있으므로 재계산할 필요가 없다.
         source_type="google_news_search",
         origin=SourceOrigin.AUTO_PROMOTED,
         interval_hours=keyword.interval_hours,

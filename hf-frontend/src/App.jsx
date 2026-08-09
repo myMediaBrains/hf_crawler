@@ -6,6 +6,7 @@ import { toast, Toaster } from 'react-hot-toast';
 import ArticleCard from './ArticleCard';
 import SourceEvaluation from "./SourceEvaluation";
 import GenreEditor from "./GenreEditor";
+import GenrePreferenceSelector from "./GenrePreferenceSelector";
 import CrawlToggleButton from "./CrawlToggleButton";
 import UserRegister from "./UserRegister";
 import ChatWindow from "./ChatWindow";
@@ -84,18 +85,20 @@ function isAutoOrigin(origin) {
 // (프로필을 결론 유도가 아니라 필터링에만 쓰는 원칙), 소스 관리 화면에서도
 // 같은 기준으로 살짝 표시해준다. 카테고리 문자열 목록만 여기서 관리하면 되고,
 // 새 민감 카테고리가 생기면 이 배열에 추가하기만 하면 된다.
-const SENSITIVE_CATEGORIES = ['Politics', 'Economy'];
+// 2026-08-09: SENSITIVE_CATEGORIES 하드코딩 배열 삭제. 이제 백엔드 /sources
+// 응답의 sensitive 필드(Tag.sensitive를 조인한 값)를 그대로 쓴다 - 프론트/백엔드
+// 두 곳에 같은 정보를 따로 관리하던 중복을 없앰.
 
-function isSensitiveCategory(category) {
-    return SENSITIVE_CATEGORIES.includes(category);
+// group.category(그룹 이름 문자열)가 아니라 group 객체 전체를 받는다 - 그룹 안에
+// sensitive 소스가 하나라도 있으면 그 그룹 전체를 민감으로 취급.
+function isSensitiveCategory(group) {
+    return !!group.sensitive;
 }
 
-// 소스 목록을 카테고리별로 묶는다. 카테고리가 비어있으면 "미분류"로 모으고
-// 항상 맨 뒤에 배치한다. 카테고리 이름/소스 이름 모두 가나다(알파벳)순 정렬.
 function groupSourcesByCategory(list) {
     const buckets = {};
     list.forEach((src) => {
-        const cat = src.category && src.category.trim() ? src.category : '미분류';
+        const cat = src.major_category && src.major_category.trim() ? src.major_category : '미분류';
         if (!buckets[cat]) buckets[cat] = [];
         buckets[cat].push(src);
     });
@@ -109,36 +112,32 @@ function groupSourcesByCategory(list) {
     return categoryNames.map((category) => ({
         category,
         sources: buckets[category].sort((a, b) => a.name.localeCompare(b.name)),
+        sensitive: buckets[category].some((src) => src.sensitive),
+        // 그룹 안에 sensitive=true인 소스가 하나라도 있으면 그룹 전체를 민감으로 표시.
     }));
 }
 
-// fail_count가 3 이상이면 "탈락 후보"로 취급 (SourceStatus.FAILING 판정 기준과 동일)
 function isFailingCandidate(src) {
     return (src.fail_count || 0) >= 3;
 }
 
-// 카테고리 필터 / 탈락 후보 필터를 적용한 목록을 반환한다.
-// 두 필터는 상호 배타적으로 쓰인다 (동시에 켜면 어느 한쪽이 무시된 것처럼
-// 보여 혼란스러우므로, 호출부에서 토글 시 반대쪽을 항상 꺼준다).
 function applySourceFilters(list, categoryFilter, showFailingOnly) {
     if (showFailingOnly) {
         return list.filter(isFailingCandidate);
     }
     if (categoryFilter) {
         return list.filter((src) => {
-            const cat = src.category && src.category.trim() ? src.category : '미분류';
+            const cat = src.major_category && src.major_category.trim() ? src.major_category : '미분류';
             return cat === categoryFilter;
         });
     }
     return list;
 }
 
-// 필터 칩에 표시할 "카테고리별 개수"는 항상 전체 목록 기준으로 계산한다
-// (필터를 걸어도 다른 카테고리 버튼의 숫자가 사라지면 안 되기 때문).
 function getCategoryCounts(list) {
     const counts = {};
     list.forEach((src) => {
-        const cat = src.category && src.category.trim() ? src.category : '미분류';
+        const cat = src.major_category && src.major_category.trim() ? src.major_category : '미분류';
         counts[cat] = (counts[cat] || 0) + 1;
     });
     const names = Object.keys(counts).sort((a, b) => {
@@ -1205,6 +1204,8 @@ function App() {
                         </button>
                     </form>
 
+                    <GenrePreferenceSelector />
+
                     {/* 검색주기설정: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
                         저장을 눌러야 실제로 반영된다 (8/7 세션 후반 - 상시 노출 대신 토글로 변경) */}
                     <div style={{ position: 'relative' }}>
@@ -1407,7 +1408,7 @@ function App() {
                                                             >
                                                                 <span className="source-table-category-toggle">▶</span>
                                                                 {group.category}
-                                                                {isSensitiveCategory(group.category) && (
+                                                                {isSensitiveCategory(group) && (
                                                                     <span
                                                                         className="source-table-sensitive-badge"
                                                                         title="민감 카테고리 — 개인화 프로필에서 결론 유도가 아닌 정보 필터링 용도로만 사용"
@@ -1445,7 +1446,7 @@ function App() {
                                                             >
                                                                 <span className="source-table-category-toggle">▼</span>
                                                                 {group.category}
-                                                                {isSensitiveCategory(group.category) && (
+                                                                {isSensitiveCategory(group) && (
                                                                     <span
                                                                         className="source-table-sensitive-badge"
                                                                         title="민감 카테고리 — 개인화 프로필에서 결론 유도가 아닌 정보 필터링 용도로만 사용"
@@ -1490,7 +1491,7 @@ function App() {
                                                             </a>
                                                         </td>
                                                         <td className="source-table-interval">
-                                                            {src.category === 'BlockList' ? (
+                                                            {src.source_type === 'blocked' ? (
                                                                 <span
                                                                     className="source-table-block-reason"
                                                                     title="크롤링이 계속 막혀 기사를 저장하지 못한 사유"

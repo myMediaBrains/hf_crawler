@@ -19,9 +19,9 @@ from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from database import engine, create_db_and_tables
-from models import Article, TextGeneration, ContentOrigin
+from models import Article, TextGeneration, ContentOrigin, Keyword, Tag
 import model_router
-from .retrieval import get_context_articles
+from .retrieval import get_context_articles, _match_keyword_semantically
 from personalization import classify_and_store
 
 import priority
@@ -210,58 +210,98 @@ _INSUFFICIENT_EVIDENCE_MESSAGE = (
 )
 
 
-def _extract_search_keyword(query: str) -> str:
+def _classify_and_prepare_keyword(query: str, session: Session) -> dict:
     """
-    채팅 질문(한국어일 수 있음)을 영어 뉴스 검색어로 압축한다. 실패하면 안전하게
-    원문을 그대로 반환한다 (검색 품질은 떨어지지만 최소한 에러는 안 남).
+    채팅 자동수집이 새 키워드를 등록해야 할 때 호출된다 (2026-08-09, 분류체계
+    통합 재설계 반영판).
+
+    1) 먼저 기존 등록 키워드(Keyword.name) 중 의미상 일치하는 게 있는지 확인
+       한다 - 있으면 새로 안 만들고 그 키워드를 재사용한다.
+    2) 없으면 LLM에게 대분류/중분류/검색문구를 한 번에 만들게 한다. 대분류는
+       "기존 Tag.major_category 목록"을 먼저 보여주고 최대한 재사용을 유도해서,
+       taxonomy가 무한정 늘어나는 걸 막는다.
+    3) 실제 Tag/Keyword 생성은 여기서 안 하고, /collect/deep-incremental
+       (main.py, 8000)에 major_category/search_query를 실어 보내서 그쪽이
+       tagging.get_or_create_tag()로 만들도록 위임한다 - Tag 생성 로직을
+       크롤러 서비스 한 곳에만 두기 위함(8001에서 직접 만들지 않음).
     """
+    existing = _match_keyword_semantically(query, session)
+    if existing:
+        return {"existing_keyword": existing[0]}
+
+    existing_majors = session.exec(select(Tag.major_category).distinct()).all()
+    majors_list = sorted({m for m in existing_majors if m})
+
     prompt = (
-        f"다음 질문을 영어 뉴스 검색에 적합한 3~5단어 키워드로 압축해줘. "
-        f"키워드만 출력하고 다른 설명은 붙이지 마: \"{query}\""
+        f"질문: \"{query}\"\n\n"
+        f"이미 등록된 대분류 목록: {', '.join(majors_list) if majors_list else '(아직 없음)'}\n\n"
+        "이 질문이 어떤 주제에 속하는지 분류해줘. 가능하면 위 목록에 있는 대분류를 "
+        "그대로 재사용하고, 정말 어디에도 안 맞을 때만 새 대분류를 만들어. "
+        "중분류는 분류/검색에 쓸 짧은 이름(1~3단어 영어)으로, 검색문구는 Google "
+        "뉴스 검색에 적합한 영어 자연어 문구로 따로 만들어줘.\n\n"
+        "아래 형식으로 정확히 3줄만 출력해 (다른 설명 붙이지 마):\n"
+        "대분류: ...\n"
+        "중분류: ...\n"
+        "검색문구: ..."
     )
     try:
-        raw = model_router.chat("extract_keyword", [{"role": "user", "content": prompt}])
-        keyword = raw.strip().strip('"').strip("'")
-        return keyword if keyword else query[:80]
+        raw = model_router.chat("propose_taxonomy", [{"role": "user", "content": prompt}])
     except Exception as e:
-        logger.warning(f"[chat] 검색 키워드 압축 실패, 원문으로 대체: {e}")
-        return query[:80]
+        logger.warning(f"[chat] 분류 생성 실패, 단순화된 값으로 대체: {e}")
+        return {"major_category": "Misc", "mid_category": query[:40], "search_query": query[:80]}
+
+    major, mid, search_query = None, None, None
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if line.startswith("대분류"):
+            major = line.split(":", 1)[-1].strip()
+        elif line.startswith("중분류"):
+            mid = line.split(":", 1)[-1].strip()
+        elif line.startswith("검색문구"):
+            search_query = line.split(":", 1)[-1].strip()
+
+    return {
+        "major_category": major or "Misc",
+        "mid_category": (mid or query[:40])[:40],
+        "search_query": search_query or query[:80],
+    }
 
 
 def _trigger_background_collection(query: str) -> None:
     """
-    근거가 없을 때, 질문을 영어 검색어로 압축해 크롤러(8000)의 기존
-    /collect/deep-incremental?keyword=... 를 호출한다. 이 엔드포인트는 이미
-    "키워드가 없으면 자동 등록 후 즉시 수집" 로직을 갖고 있어 그대로 재사용한다.
-    채팅 응답을 기다리게 하면 안 되므로 별도 daemon 스레드에서 fire-and-forget으로
-    실행하고, 실패해도 채팅 자체에는 영향 없게 예외를 삼킨다.
+    근거가 없을 때 백그라운드로 크롤러(8000)의 /collect/deep-incremental을
+    호출한다. 채팅 응답을 기다리게 하면 안 되므로 daemon 스레드에서
+    fire-and-forget으로 실행하고, 실패해도 채팅 자체엔 영향 없게 예외를 삼킨다.
 
-    ⚠️ 질문 원문을 그대로 키워드로 등록하면 안 됨(2026-08-09 실사용 중 발견):
-    (1) 매번 새로운 문장이 키워드로 계속 쌓여 키워드 목록이 오염되고,
-    (2) 이 프로젝트 소스가 영어권 전용(hl=en-US&gl=US)이라 한국어 원문으로는
-        검색 결과가 안 나온다. 그래서 반드시 _extract_search_keyword()로
-        압축한 영어 키워드를 써야 한다.
+    2026-08-09 분류체계 통합 재설계 반영: 질문 원문을 그대로 키워드에 박던
+    방식 대신, 먼저 기존 키워드 재사용을 시도하고, 새로 만들어야 할 때는
+    대분류/중분류/검색문구를 분리해서 Tag가 오염되지 않게 한다. register는
+    이제 항상 true - Tag 시스템 덕분에 taxonomy 오염 걱정 없이 영구 등록해도
+    장르편집기에서 정상적으로 관리 가능하다.
     """
     def _run():
-        search_keyword = _extract_search_keyword(query)
+        with Session(engine) as session:
+            info = _classify_and_prepare_keyword(query, session)
+
         try:
-            resp = requests.get(
-                f"{MAIN_API_BASE}/collect/deep-incremental",
-                # max_entries=5: 위와 동일한 이유.
-                # register=false: 채팅에서 자동 트리거된 수집은 영구 키워드로
-                # 등록하지 않는다 (2026-08-09) - 등록해버리면 사용자가 검색창에
-                # 입력한 적도 없는 키워드(채팅 질문 원문 포함)가 스케줄러에 영구
-                # 등록되어 매일 반복 수집되고, 이게 쌓일수록 스케줄러 틱마다 할 일이
-                # 계속 늘어나는 근본 문제가 있었음.
-                params={
-                    "keyword": search_keyword, "months_back": 1, "interval_hours": 24,
-                    "max_entries": 5, "register": "false",
-                },
-                timeout=180,
-            )
-            logger.info(f"[chat] 근거 부족 자동 수집 요청 결과: '{search_keyword}' -> HTTP {resp.status_code}")
+            if "existing_keyword" in info:
+                keyword_name = info["existing_keyword"]
+                params = {
+                    "keyword": keyword_name, "months_back": 1, "interval_hours": 24,
+                    "max_entries": 5, "register": "true",
+                }
+            else:
+                keyword_name = info["mid_category"]
+                params = {
+                    "keyword": keyword_name, "months_back": 1, "interval_hours": 24,
+                    "max_entries": 5, "register": "true",
+                    "major_category": info["major_category"],
+                    "search_query": info["search_query"],
+                }
+            resp = requests.get(f"{MAIN_API_BASE}/collect/deep-incremental", params=params, timeout=180)
+            logger.info(f"[chat] 근거 부족 자동 수집 요청 결과: '{keyword_name}' -> HTTP {resp.status_code}")
         except Exception as e:
-            logger.warning(f"[chat] 근거 부족 자동 수집 요청 실패 ('{search_keyword}'): {e}")
+            logger.warning(f"[chat] 근거 부족 자동 수집 요청 실패: {e}")
 
     threading.Thread(target=_run, daemon=True, name="chat-auto-collect").start()
 

@@ -2,15 +2,19 @@
 models.py
 전체 DB 스키마.
 
-주의: 이 파일은 실제 원본을 기준으로 작성됐다. 기존 Article/Notification/
-UserPreference의 필드는 하나도 건드리지 않았고(기존 DB 데이터 보존),
-신규 기능에 필요한 필드/테이블만 추가했다.
+2026-08-09 대개편: CATEGORY_CONFIG(main.py) / SUBCATEGORY_CONFIG
+(personalization_taxonomy.py) / TAXONOMY(taxonomy.py) 3개의 하드코딩 딕셔너리
+기반 분류 시스템을 Tag/TagKeyword/TagBlacklist/ArticleTag/TagRelation 5개
+테이블로 통합했다. Article/Keyword/Source/InteractionSignal이 전부 이 Tag
+하나를 참조한다.
 
-테이블명 규칙: 기존 코드가 __tablename__을 복수형으로 명시하는 관례
-(articles, notifications, user_preferences)를 따라, 새 테이블도 전부
-복수형으로 명시했다. 외래키는 반드시 이 복수형 테이블명을 참조해야 한다
-(예: "articles.id", "keywords.id") - 예전 버전에서 이 부분을 단수형으로
-잘못 썼던 실수를 여기서 바로잡았다.
+이번 개편은 기존 데이터(기사 전체)를 보존하지 않고 DB를 새로 만드는 걸
+전제로 한다 (마이그레이션이 아니라 재생성) - 그래서 예전 category/
+major_category/mid_category(Keyword), subcategory/top_category
+(InteractionSignal) 같은 필드는 새 스키마에 아예 없다.
+
+테이블명 규칙: 전부 복수형(__tablename__)을 명시한다. 외래키는 반드시 이
+복수형 테이블명을 참조해야 한다 (예: "articles.id", "tags.id").
 """
 
 from enum import Enum
@@ -30,6 +34,7 @@ class ContentOrigin(str, Enum):
     LLM_CLEANED = "llm_cleaned"       # LLM이 노이즈 제거/문단 정리
     LLM_TRANSLATED = "llm_translated" # LLM이 번역
     USER_EDITED = "user_edited"       # 사용자가 에디터에서 직접 수정
+    LLM_GENERATED = "llm_generated"   # 텍스트 생성기가 처음부터 만든 콘텐츠
 
 
 class SourceOrigin(str, Enum):
@@ -52,7 +57,106 @@ class CandidateStatus(str, Enum):
 
 
 # ============================================================
-# 기존 Article - 필드는 전혀 건드리지 않고, 신규 필드만 끝에 추가
+# 분류 체계 통합 (신규, 2026-08-09) — 모든 분류의 유일한 원천
+# ============================================================
+
+class Tag(SQLModel, table=True):
+    """
+    기사/키워드/소스/개인화신호가 전부 참조하는 유일한 분류 단위.
+    다중 부여 가능(ArticleTag를 통해 기사 하나에 태그 여러 개).
+
+    빈 상태로 시작한다 - 하드코딩 시딩 데이터 없음. 장르 편집기(사람이 직접
+    등록)와 채팅 자동수집(LLM이 근거 부족 시 제안)을 통해서만 채워진다.
+    """
+    __tablename__ = "tags"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(unique=True, index=True)
+    # 정규화된 고유 이름. 예: "Travel", "AI.PRODUCT". 장르편집기의 "소분류" 칸,
+    # Keyword.name과 1:1로 맞춰 쓰는 걸 기본 규칙으로 한다.
+
+    major_category: str = Field(index=True)
+    # 대분류. 예: "AI", "Life". 장르편집기의 "대분류" 칸.
+
+    mid_category: Optional[str] = None
+    # 중분류(사람이 읽는 라벨). 예: "AI 제품/서비스". 장르편집기의 "중분류" 칸.
+
+    label_ko: Optional[str] = None
+    # 화면 표시용 한글 라벨 (없으면 name/mid_category로 대체 표시)
+
+    sensitive: bool = Field(default=False)
+    # 기존 SENSITIVE_TOP_CATEGORIES({"Politics","Economy"}) 대체.
+    # True면 개인화 프로필에서 "결론 유도"가 아니라 "정보 필터링"에만 쓴다.
+
+    dimension: str = Field(default="topic")
+    # "topic"(기본) - 향후 "location"/"person"/"genre" 등으로 확장 가능한 자리.
+    # 지금 당장은 전부 "topic"으로만 씀 (과설계 방지).
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Tag(name={self.name}, major={self.major_category})>"
+
+
+class TagKeyword(SQLModel, table=True):
+    """
+    Tag 하나가 매칭에 쓰는 키워드(용어) 목록. 기존 CATEGORY_CONFIG[category]
+    ["keywords"] 대체. 정규식 매칭에 그대로 쓰인다 - 제목 3배/본문 1배 가중치
+    점수제는 기존 _score_categories_for_article() 로직을 그대로 재사용.
+
+    새 Tag 생성 시 name 자체가 자동으로 첫 TagKeyword로 등록된다 (최소한의
+    매칭이 바로 작동하도록) - 사람/LLM이 이후 동의어를 더 추가할 수 있음.
+    """
+    __tablename__ = "tag_keywords"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tag_id: int = Field(foreign_key="tags.id", index=True)
+    term: str = Field(index=True)
+
+
+class TagBlacklist(SQLModel, table=True):
+    """Tag 하나를 오분류에서 제외시키는 단어 목록. 기존 CATEGORY_CONFIG[category]["blacklist"] 대체."""
+    __tablename__ = "tag_blacklists"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tag_id: int = Field(foreign_key="tags.id", index=True)
+    term: str
+
+
+class ArticleTag(SQLModel, table=True):
+    """
+    기사 ↔ 태그 다대다. 기사 하나가 여러 태그를 가질 수 있다 (기존
+    Article.category 단일값의 한계를 해결하는 핵심 테이블).
+    """
+    __tablename__ = "article_tags"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    article_id: int = Field(foreign_key="articles.id", index=True)
+    tag_id: int = Field(foreign_key="tags.id", index=True)
+    score: float = Field(default=1.0)
+    # _score_categories_for_article()이 계산한 매칭 점수를 그대로 저장
+    # (나중에 랭킹/정렬에 활용 가능).
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class TagRelation(SQLModel, table=True):
+    """
+    태그 간 연관성 그래프(무방향 엣지). 완전 신규 개념 - 기존 3개 분류
+    시스템 어디에도 없던 것. "여행-음식", "음악-여행" 같은 관계를 명시한다.
+    """
+    __tablename__ = "tag_relations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tag_a_id: int = Field(foreign_key="tags.id", index=True)
+    tag_b_id: int = Field(foreign_key="tags.id", index=True)
+    weight: float = Field(default=0.5)     # 0~1, 연관 강도
+    source: str = Field(default="manual")  # "manual" | "co_occurrence" | "llm_inferred"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ============================================================
+# Article - 기존 필드 보존, category는 레거시로 방치(더 이상 안 채움)
 # ============================================================
 
 class Article(SQLModel, table=True):
@@ -70,36 +174,31 @@ class Article(SQLModel, table=True):
         sa_column=Column(DateTime, server_default=func.now())
     )
 
-    # 추가 필드 (기존)
     summary: Optional[str] = None
     category: Optional[str] = None
+    # 2026-08-09부터 레거시. 더 이상 채우지 않음 - 다중 분류는 ArticleTag를 참조할 것.
+    # 컬럼 자체는 하위호환을 위해 남겨둠(과거 데이터가 있었다면 보존되지만,
+    # 이번 개편은 DB를 새로 만드는 전제라 실질적으로는 항상 비어있게 됨).
     is_read: bool = Field(default=False)
     is_favorite: bool = Field(default=False)
 
-    # --- 신규: 원본 보존 (ML 학습 대비) ---
     raw_content: Optional[str] = None
     # 크롤링 직후 텍스트를 그대로 담아둔다. content는 정제/편집할 때마다 계속
-    # 갱신되지만, 이 필드는 절대 덮어쓰지 않는다 (정제 전/후 쌍이 있어야
-    # 나중에 "정제 모델"을 학습시킬 수 있기 때문).
+    # 갱신되지만, 이 필드는 절대 덮어쓰지 않는다.
 
-    # --- 신규: 키워드 수집 태깅 ---
     keyword: Optional[str] = Field(default=None, index=True)
     # 사용자가 등록한 키워드로 수집된 기사면 그 키워드 이름이 들어간다.
-    # 기존 고정 RSS로 수집된 기사는 None. 키워드 버튼 클릭 시
-    # 정확한 매칭(WHERE keyword = ...)에 이 필드를 쓴다.
+    # 기존 고정 RSS로 수집된 기사는 None.
 
-    # --- 신규: 이력 메타정보 ---
     origin: ContentOrigin = Field(default=ContentOrigin.RAW_CRAWL)
     model_used: Optional[str] = None
-    # collected_at이 이미 "언제 생성됐는지"를 담당하고 있어 created_at은
-    # 별도로 추가하지 않았다 (중복 필드 방지).
 
     def __repr__(self):
         return f"<Article(id={self.id}, title={self.title[:30]}...)>"
 
 
 # ============================================================
-# 기존 Notification - 그대로 보존 (신규 코드에서 참조하지 않음)
+# Notification - 그대로 보존
 # ============================================================
 
 class Notification(SQLModel, table=True):
@@ -119,15 +218,14 @@ class Notification(SQLModel, table=True):
     def __repr__(self):
         return f"<Notification(id={self.id}, article_id={self.article_id})>"
 
+
 # ============================================================
-# 사용자 프로필 (신규) — 비밀번호 없는 로컬 개인용 식별자
+# 사용자 프로필 — 비밀번호 없는 로컬 개인용 식별자
 # ============================================================
 
 class User(SQLModel, table=True):
     """
     사용자가 직접 정하는 문자열 ID로 등록한다 (인증 없음, 로컬 개인용).
-    등록 시점에 personalization.register_user_and_backfill()이 그동안
-    user_id가 비어있던 InteractionSignal/TextGeneration을 이 사용자에게 일괄 귀속시킨다.
     """
     __tablename__ = "users"
 
@@ -141,14 +239,13 @@ class User(SQLModel, table=True):
 
 
 # ============================================================
-# 배송 로그 (신규) — 어떤 생성 결과를 언제 어디로 보냈는지 기록
+# 배송 로그 — 어떤 생성 결과를 언제 어디로 보냈는지 기록
 # ============================================================
 
 class Delivery(SQLModel, table=True):
     """
-    text_generations 한 건을 외부 채널로 보낸 기록. 실험 단계에서는
-    channel="ntfy"(실제 발송) / channel="email"(발송은 안 하고 mailto 링크만
-    만들어준 것 — 사용자가 직접 클릭해서 보냄)을 지원한다.
+    text_generations 한 건을 외부 채널로 보낸 기록. channel="ntfy"(실제 발송)
+    / channel="email"(mailto 링크만 만들어준 것 — 사용자가 직접 클릭해서 보냄).
     """
     __tablename__ = "deliveries"
 
@@ -165,7 +262,7 @@ class Delivery(SQLModel, table=True):
 
 
 # ============================================================
-# 기존 UserPreference - 그대로 보존
+# UserPreference - 그대로 보존
 # ============================================================
 
 class UserPreference(SQLModel, table=True):
@@ -186,10 +283,7 @@ class UserPreference(SQLModel, table=True):
 
 
 # ============================================================
-# 번역 이력 (신규)
-# 지금까지는 SSE로 스트리밍만 되고 DB 어디에도 남지 않았다. 이 테이블이
-# 생기면 번역 결과가 영구 보존되어, 나중에 번역 모델을 파인튜닝하고 싶을 때
-# 그대로 학습 데이터로 쓸 수 있다.
+# 번역 이력
 # ============================================================
 
 class Translation(SQLModel, table=True):
@@ -203,17 +297,14 @@ class Translation(SQLModel, table=True):
     origin: ContentOrigin = Field(default=ContentOrigin.LLM_TRANSLATED)
     model_used: Optional[str] = None
     block_reason: Optional[str] = None
-    # 블록리스트(category="블록리스트")에만 채워지는 사유 키워드.
+    # 블록리스트(Source.source_type="blocked")에만 채워지는 사유 키워드.
     # 예: "타임아웃" / "동의배너차단" / "본문추출실패" / "차단(원인불명)"
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ============================================================
-# 수집 소스 (신규)
-# 기존 main.py의 TARGET_SOURCES 하드코딩 리스트를 대체한다.
-# source_type이 Collector 레지스트리 조회 키가 되어, 미디어 타입이
-# 늘어나도(유튜브/팟캐스트 등) 이 테이블 구조는 그대로 재사용된다.
+# 수집 소스 — category(문자열) 대신 tag_id(FK)로 분류
 # ============================================================
 
 class Source(SQLModel, table=True):
@@ -222,9 +313,15 @@ class Source(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     url: str = Field(unique=True, index=True)
-    category: Optional[str] = None
+
+    tag_id: Optional[int] = Field(default=None, foreign_key="tags.id")
+    # 2026-08-09: category(문자열) 대체. 승격된 소스는 원본 키워드의 tag_id를
+    # 그대로 물려받는다. BlockList 여부는 이제 tag_id가 아니라 source_type으로만
+    # 판별한다 (예전엔 category="BlockList"와 source_type="blocked"가 같은 걸
+    # 이중으로 나타내는 중복 정보였음 - source_type 하나로 정리).
 
     source_type: str = Field(default="rss", index=True)
+    # "rss" | "google_news_search" | "blocked"
 
     origin: SourceOrigin = Field(default=SourceOrigin.MANUAL)
     status: SourceStatus = Field(default=SourceStatus.ACTIVE)
@@ -237,38 +334,45 @@ class Source(SQLModel, table=True):
     keyword_id: Optional[int] = Field(default=None, foreign_key="keywords.id")
 
     model_used: Optional[str] = None
-    block_reason: Optional[str] = None   # ← 이 줄이 있는지 확인
+    block_reason: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ============================================================
-# 사용자 등록 키워드 (신규)
+# 사용자 등록 키워드 — "무엇을 언제 재검색할지"만 담당 (분류는 Tag로 위임)
 # ============================================================
 
 class Keyword(SQLModel, table=True):
+    """
+    백그라운드 검색 구독. 2026-08-09부터 분류(major_category/mid_category)는
+    더 이상 여기서 안 하고 tag_id로 위임한다 - 이 테이블은 순수하게
+    "무엇을 검색어로, 얼마나 자주, 최근 몇 개월치를 가져올지"만 관리한다.
+    """
     __tablename__ = "keywords"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(unique=True, index=True)
+    # 구독 식별자. Tag.name과 1:1로 맞추는 걸 기본 규칙으로 한다
+    # (장르편집기에서 등록하면 Keyword.name == Tag.name이 되도록 만든다).
+
+    tag_id: Optional[int] = Field(default=None, foreign_key="tags.id", index=True)
+    # 분류는 여기로 위임. None이면 아직 분류가 안 된 임시 구독.
+
+    search_query: Optional[str] = None
+    # 2026-08-09 신규: 실제 Google 뉴스 검색에 쓸 자유로운 자연어 문구.
+    # name(분류용, 짧고 정규화)과 분리 - 채팅 자동수집이 "trending food
+    # recipes, popular dishes now..." 같은 문장을 name에 박아버리던 오염
+    # 문제(2026-08-09 실사용 중 발견)의 재발 방지. 비어있으면 name을 그대로
+    # 검색어로 쓴다 (collectors.py에서 폴백 처리).
 
     months_back: int = Field(default=1)
-    # 검색창 옆 입력창 A: 즉시 수집 시 "최근 N개월" 데이터만 가져온다.
-
     interval_hours: float = Field(default=24.0)
-    # 검색창 옆 입력창 B: 백그라운드에서 이 키워드를 몇 시간 간격으로 재수집할지.
-
-    major_category: Optional[str] = None
-    # 대분류(장르) - taxonomy.py가 자동 시딩할 때 채운다. "장르별 출처 평가"의
-    # 장르 버튼과 동일한 값이 되도록, 승격 시 Source.category에도 그대로 들어간다.
-    mid_category: Optional[str] = None
-    # 중분류 - 지금은 Keyword.name과 동일한 값이지만, 나중에 사람이 읽기 쉬운
-    # 라벨을 name과 다르게 붙이고 싶을 때를 대비해 분리해뒀다.
-
     last_collected_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+
 # ============================================================
-# 승격 후보 소스 추적 (신규)
+# 승격 후보 소스 추적 - 그대로 보존
 # ============================================================
 
 class CandidateSource(SQLModel, table=True):
@@ -289,8 +393,7 @@ class CandidateSource(SQLModel, table=True):
 class BlockedDomain(SQLModel, table=True):
     """
     사용자가 출처관리에서 '블록리스트' 소스를 삭제하면 여기에 도메인이 기록된다.
-    이후 수집(collect_for_keyword/collect)에서 이 도메인이 RSS 결과에 다시 나와도
-    크롤링을 시도하지 않고 즉시 건너뛴다 - "삭제 = 앞으로도 검색 안 함"을 보장하기 위함.
+    이후 수집에서 이 도메인이 다시 나와도 크롤링을 시도하지 않고 즉시 건너뛴다.
     """
     __tablename__ = "blocked_domains"
 
@@ -301,7 +404,7 @@ class BlockedDomain(SQLModel, table=True):
 
 
 # ============================================================
-# 스케줄러 전역 설정 (신규, 항상 1행만 존재하는 싱글턴 테이블)
+# 스케줄러 전역 설정 - 그대로 보존
 # ============================================================
 
 class SchedulerConfig(SQLModel, table=True):
@@ -311,70 +414,45 @@ class SchedulerConfig(SQLModel, table=True):
     tick_minutes: int = Field(default=30)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-# -*- coding: utf-8 -*-
-"""
-models_addon_interaction_signal.py
-------------------------------------
-이 내용을 기존 models.py 맨 끝에 그대로 붙여넣으세요 (import는 이미 models.py
-상단에 있는 것들만 사용하므로 추가 import 불필요 — Optional, SQLModel, Field,
-datetime 이미 있음).
 
-기존 UserPreference 테이블(categories/keywords를 JSON 문자열로 뭉뚱그려 저장)은
-그대로 두고 건드리지 않는다. 대신 "신호 하나하나의 원본 로그"를 남기는 새 테이블을
-추가한다 — UserPreference는 나중에 이 로그로부터 집계된 요약본을 캐싱하는 용도로
-계속 쓸 수 있다 (지금 당장은 비워두고, personalization.py가 즉석 계산으로 대체).
-
-__tablename__ 복수형 규칙 유지: interaction_signals
-"""
-
+# ============================================================
+# 개인화 신호 원본 로그 — subcategory/top_category(문자열) 대신 tag_id
+# ============================================================
 
 class InteractionSignal(SQLModel, table=True):
     """
-    개인화 프로필의 원재료가 되는 신호 원본 로그.
-    - 브라우저 확장 이벤트, 대화 발화, 명시적 피드백(👍👎) 모두 이 한 테이블에 쌓인다.
-    - 절대 UPDATE하지 않는다 (append-only 로그). 집계는 항상 조회 시점에 계산한다
-      (raw_content를 절대 안 건드리는 Article 원칙과 같은 이유 — 나중에 다른 방식으로
-      재집계하고 싶을 때 원본이 훼손되지 않아야 하기 때문).
+    개인화 프로필의 원재료가 되는 신호 원본 로그. 절대 UPDATE하지 않는다
+    (append-only). 집계는 항상 조회 시점에 계산한다.
+
+    2026-08-09: subcategory(SUBCATEGORY_CONFIG 코드 문자열) 대신 tag_id(FK)로
+    변경. major_category는 집계 시 매번 조인하지 않도록 비정규화해서 그대로 둔다
+    (기존 원칙 유지 - "조인 없이 바로 집계하기 위한 비정규화 필드").
     """
-    _tablename__ = "interaction_signals"
+    __tablename__ = "interaction_signals"
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    # 어느 사용자의 신호인지 (없으면 등록 전에 쌓인 신호 — 등록 시 일괄 귀속됨)
     user_id: Optional[str] = Field(default=None, foreign_key="users.user_id", index=True)
-
-    # 어떤 기사/맥락에서 나온 신호인지 (없을 수도 있음 - 예: 순수 채팅 질문)
     article_id: Optional[int] = Field(default=None, foreign_key="articles.id", index=True)
 
     source: str = Field(index=True)
-    # "extension" | "chat" | "feedback_explicit"
+    # "extension" | "chat" | "chat_expand" | "chat_delivered" | "chat_no_evidence" | "feedback_explicit"
 
-    subcategory: str = Field(index=True)
-    # personalization_taxonomy.SUBCATEGORY_CONFIG 의 코드 (예: "ECON.STOCK")
+    tag_id: int = Field(foreign_key="tags.id", index=True)
+    major_category: str = Field(index=True)
+    # Tag.major_category를 신호 발생 시점에 복사해둔 비정규화 필드.
 
-    top_category: str = Field(index=True)
-    # 기존 CATEGORY_CONFIG 키와 동일한 값 (예: "Economy") - 조인 없이 바로 집계하기 위한 비정규화 필드
-
-    signal_type: str = Field(default="implicit")
-    # "explicit" | "implicit"
-
+    signal_type: str = Field(default="implicit")     # "explicit" | "implicit"
     confidence: float = Field(default=0.5)
     weight: float = Field(default=1.0)
-
     raw_snippet: Optional[str] = None
-    # 원문 일부 (근거 제시용). 너무 길게 넣지 말 것 (제목/발췌 수준 권장).
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    # DB에는 UTC로 저장 (기존 Article.collected_at과 동일한 관례 유지).
-    # KST 표시는 조회/응답 시점에 personalization.py의 to_kst()로 변환한다.
 
-class ContentOrigin(str, Enum):
-    RAW_CRAWL = "raw_crawl"
-    LLM_CLEANED = "llm_cleaned"
-    LLM_TRANSLATED = "llm_translated"
-    USER_EDITED = "user_edited"
-    LLM_GENERATED = "llm_generated"  # 신규: 텍스트 생성기가 처음부터 만든 콘텐츠
 
+# ============================================================
+# 텍스트 생성기 이력 - 그대로 보존
+# ============================================================
 
 class TextGeneration(SQLModel, table=True):
     """개인화 텍스트 생성기의 질의-응답 이력 (append-only, 절대 UPDATE하지 않음)."""
