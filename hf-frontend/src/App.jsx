@@ -4,7 +4,6 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast, Toaster } from 'react-hot-toast';
 import ArticleCard from './ArticleCard';
-import SourceEvaluation from "./SourceEvaluation";
 import GenreEditor from "./GenreEditor";
 import GenrePreferenceSelector from "./GenrePreferenceSelector";
 import CrawlToggleButton from "./CrawlToggleButton";
@@ -74,80 +73,6 @@ function articleReducer(state, action) {
     }
 }
 
-// 소스 출처(origin)가 자동 승격인지 판별 - models.py의 SourceOrigin
-// (MANUAL/AUTO_PROMOTED/MANUAL_ADDED) 값이 그대로 내려오므로 문자열에
-// "auto"가 포함되는지로 판별한다 (대소문자 무관하게 안전히 처리).
-function isAutoOrigin(origin) {
-    return typeof origin === 'string' && origin.toLowerCase().includes('auto');
-}
-
-// 정치/경제 카테고리는 personalization 레이어에서 "민감 카테고리"로 다루므로
-// (프로필을 결론 유도가 아니라 필터링에만 쓰는 원칙), 소스 관리 화면에서도
-// 같은 기준으로 살짝 표시해준다. 카테고리 문자열 목록만 여기서 관리하면 되고,
-// 새 민감 카테고리가 생기면 이 배열에 추가하기만 하면 된다.
-// 2026-08-09: SENSITIVE_CATEGORIES 하드코딩 배열 삭제. 이제 백엔드 /sources
-// 응답의 sensitive 필드(Tag.sensitive를 조인한 값)를 그대로 쓴다 - 프론트/백엔드
-// 두 곳에 같은 정보를 따로 관리하던 중복을 없앰.
-
-// group.category(그룹 이름 문자열)가 아니라 group 객체 전체를 받는다 - 그룹 안에
-// sensitive 소스가 하나라도 있으면 그 그룹 전체를 민감으로 취급.
-function isSensitiveCategory(group) {
-    return !!group.sensitive;
-}
-
-function groupSourcesByCategory(list) {
-    const buckets = {};
-    list.forEach((src) => {
-        const cat = src.major_category && src.major_category.trim() ? src.major_category : '미분류';
-        if (!buckets[cat]) buckets[cat] = [];
-        buckets[cat].push(src);
-    });
-
-    const categoryNames = Object.keys(buckets).sort((a, b) => {
-        if (a === '미분류') return 1;
-        if (b === '미분류') return -1;
-        return a.localeCompare(b);
-    });
-
-    return categoryNames.map((category) => ({
-        category,
-        sources: buckets[category].sort((a, b) => a.name.localeCompare(b.name)),
-        sensitive: buckets[category].some((src) => src.sensitive),
-        // 그룹 안에 sensitive=true인 소스가 하나라도 있으면 그룹 전체를 민감으로 표시.
-    }));
-}
-
-function isFailingCandidate(src) {
-    return (src.fail_count || 0) >= 3;
-}
-
-function applySourceFilters(list, categoryFilter, showFailingOnly) {
-    if (showFailingOnly) {
-        return list.filter(isFailingCandidate);
-    }
-    if (categoryFilter) {
-        return list.filter((src) => {
-            const cat = src.major_category && src.major_category.trim() ? src.major_category : '미분류';
-            return cat === categoryFilter;
-        });
-    }
-    return list;
-}
-
-function getCategoryCounts(list) {
-    const counts = {};
-    list.forEach((src) => {
-        const cat = src.major_category && src.major_category.trim() ? src.major_category : '미분류';
-        counts[cat] = (counts[cat] || 0) + 1;
-    });
-    const names = Object.keys(counts).sort((a, b) => {
-        if (a === '미분류') return 1;
-        if (b === '미분류') return -1;
-        return a.localeCompare(b);
-    });
-    return names.map((category) => ({ category, count: counts[category] }));
-}
-
 
 // ============================================
 // 메인 App 컴포넌트
@@ -164,8 +89,8 @@ function App() {
     const [keyword, setKeyword] = useState('');
     const [loading, setLoading] = useState(false);
     const [message, setMessage] = useState('');
-    const [keywordStats, setKeywordStats] = useState({});
-    
+    const [keywordStats, setKeywordStats] = useState([]); // 이제 중분류 그룹 배열: [{mid_category, total_count, sub_categories}]
+    const [expandedMidCategory, setExpandedMidCategory] = useState(null);
 
     // '검색주기설정' 옆 상시 노출 입력창 2개 - 현시점 기준 최근 몇 개월 자료를 가져올지,
     // 몇 시간마다 백그라운드로 재수집할지. 예전엔 ⚙ 토글 버튼을 눌러야 나오는
@@ -175,23 +100,7 @@ function App() {
     const [intervalHours, setIntervalHours] = useState(24);
     const [showIntervalPopover, setShowIntervalPopover] = useState(false);
 
-    // 소스 관리 패널
-    const [showSourceManager, setShowSourceManager] = useState(false);
-    const [sourcesList, setSourcesList] = useState([]);
-    const [newSource, setNewSource] = useState({ name: '', url: '', category: '', interval_hours: 3 });
-    const [tickMinutes, setTickMinutes] = useState(30);
-
-    // 소스 관리 테이블 - 접기/펼치기 + 필터 상태
-    const [collapsedCategories, setCollapsedCategories] = useState(new Set());
-    const [categoryFilter, setCategoryFilter] = useState(null);   // null = 전체
-    const [showFailingOnly, setShowFailingOnly] = useState(false); // 탈락 후보만 보기
-
-    // 삭제 버튼 - 브라우저 confirm() 대신 인라인 확인/취소. 한 번에 하나의 행만
-    // 확인 상태를 가지도록 id 하나만 저장한다 (다른 행 삭제 버튼을 누르면 자동 전환).
-    const [confirmDeleteId, setConfirmDeleteId] = useState(null);
-
-    // 출처별 수집 건수 (기존 "출처 보기" 패널의 데이터를 출처 관리 테이블에 통합)
-    const [sourceCounts, setSourceCounts] = useState({}); // { [소스이름]: 건수 }
+    
 
     // 키워드 관리(삭제) 패널 - "키워드별 현황"의 "전체 보기" 버튼에서 연다.
     const [showKeywordManager, setShowKeywordManager] = useState(false);
@@ -264,11 +173,13 @@ function App() {
     // ============================================
     // API 호출 함수
     // ============================================
-    const fetchArticles = useCallback(async (targetKeyword = '') => {
+    const fetchArticles = useCallback(async (targetKeyword = '', tagId = null) => {
         try {
-            const url = targetKeyword.trim()
-                ? `${API_URL}/articles?keyword=${encodeURIComponent(targetKeyword.trim())}`
-                : `${API_URL}/articles`;
+            const url = tagId
+                ? `${API_URL}/articles?tag_id=${encodeURIComponent(tagId)}`
+                : targetKeyword.trim()
+                    ? `${API_URL}/articles?keyword=${encodeURIComponent(targetKeyword.trim())}`
+                    : `${API_URL}/articles`;
             
             const response = await axios.get(url);
             const fetched = response.data.articles || [];
@@ -324,7 +235,7 @@ function App() {
     const fetchKeywordStats = useCallback(async () => {
         try {
             const response = await axios.get(`${API_URL}/stats/keywords`);
-            setKeywordStats(response.data.keyword_stats || {});
+            setKeywordStats(response.data.mid_categories || []);
         } catch (err) {
             console.error("키워드 통계 조회 에러:", err);
         }
@@ -350,15 +261,6 @@ function App() {
         }
     }, [API_URL]);
 
-
-    const fetchSources = useCallback(async () => {
-        try {
-            const response = await axios.get(`${API_URL}/sources`);
-            setSourcesList(response.data.sources || []);
-        } catch (err) {
-            console.error("소스 목록 조회 에러:", err);
-        }
-    }, [API_URL]);
 
     const fetchVaultFolders = useCallback(async () => {
         try {
@@ -494,16 +396,6 @@ function App() {
         }
     };
 
-    // 출처별 수집 건수 조회 - 예전엔 별도 "출처 보기" 패널용이었지만,
-    // 이제 출처 관리 테이블을 열 때 함께 불러와서 건수 열에 바로 채운다.
-    const fetchSourceCounts = useCallback(async () => {
-        try {
-            const response = await axios.get(`${API_URL}/stats/sources`);
-            setSourceCounts(response.data.source_counts || {});
-        } catch (err) {
-            console.error("출처별 건수 조회 에러:", err);
-        }
-    }, [API_URL]);
 
     const handleCleanExisting = async () => {
         const toastId = toast.loading('데이터 정제 중...');
@@ -839,107 +731,11 @@ function App() {
         setShowKeywordManager(true);
     };
 
-    const handleStatClick = async (targetKw) => {
-        setKeyword(targetKw);
+    const handleStatClick = async (item) => {
+        setKeyword(item.label);
         setLoading(true);
-        await fetchArticles(targetKw);
+        await fetchArticles(item.label, item.tag_id);
         setLoading(false);
-    };
-
-    const handleToggleSourceManager = async () => {
-        if (showSourceManager) {
-            setShowSourceManager(false);
-            setConfirmDeleteId(null);
-            return;
-        }
-        await Promise.all([fetchSources(), fetchSourceCounts()]);
-        try {
-            const res = await axios.get(`${API_URL}/scheduler/config`);
-            setTickMinutes(res.data.tick_minutes);
-        } catch (err) {
-            console.error("스케줄러 설정 조회 에러:", err);
-        }
-        setShowSourceManager(true);
-    };
-
-    const handleAddSource = async () => {
-        if (!newSource.name.trim() || !newSource.url.trim()) {
-            toast('이름과 URL을 입력해주세요.');
-            return;
-        }
-        const toastId = toast.loading('소스 추가 중...');
-        try {
-            const response = await axios.post(`${API_URL}/sources`, {
-                name: newSource.name.trim(),
-                url: newSource.url.trim(),
-                category: newSource.category.trim() || null,
-                source_type: 'rss',
-                interval_hours: newSource.interval_hours,
-            });
-            toast.success(response.data.message, { id: toastId });
-            setNewSource({ name: '', url: '', category: '', interval_hours: 3 });
-            await fetchSources();
-        } catch (err) {
-            console.error("소스 추가 에러:", err);
-            toast.error(err.response?.data?.detail || '소스 추가 실패', { id: toastId });
-        }
-    };
-
-    const handleDeleteSource = async (sourceId) => {
-        // 확인은 이제 버튼 클릭 시점(인라인 UI)에서 이미 끝난 상태이므로
-        // 여기서는 실제 삭제만 수행한다. window.confirm은 더 이상 쓰지 않는다.
-        const toastId = toast.loading('삭제 중...');
-        try {
-            const response = await axios.delete(`${API_URL}/sources/${sourceId}`);
-            toast.success(response.data.message, { id: toastId });
-            setConfirmDeleteId(null);
-            await fetchSources();
-        } catch (err) {
-            console.error("소스 삭제 에러:", err);
-            toast.error('삭제 실패', { id: toastId });
-            setConfirmDeleteId(null);
-        }
-    };
-
-    const handleUpdateTickMinutes = async () => {
-        const toastId = toast.loading('스케줄러 간격 변경 중...');
-        try {
-            const res = await axios.put(`${API_URL}/scheduler/config`, { tick_minutes: tickMinutes });
-            if (res.data.warning) {
-                // 가장 짧은 소스/키워드 주기보다 스케줄러 점검 간격이 더 길면,
-                // 그 항목은 설정한 주기대로 안 돌기 때문에 경고를 보여준다.
-                toast(res.data.warning, { id: toastId, icon: '⚠️', duration: 7000 });
-            } else {
-                toast.success('변경 완료!', { id: toastId });
-            }
-        } catch (err) {
-            console.error("스케줄러 설정 변경 에러:", err);
-            toast.error('변경 실패', { id: toastId });
-        }
-    };
-
-    // 소스 하나의 점검 주기(시간)를 변경한다. 소스관리 패널의 각 행에서 인라인으로 편집.
-    const handleUpdateSourceInterval = async (sourceId, newHours) => {
-        if (!(newHours > 0)) return;
-        try {
-            const res = await axios.patch(`${API_URL}/sources/${sourceId}`, { interval_hours: newHours });
-            toast.success(res.data.message);
-            await fetchSources();
-        } catch (err) {
-            console.error("소스 주기 변경 에러:", err);
-            toast.error('주기 변경 실패');
-        }
-    };
-
-    // 마지막 점검 시각 + 점검 주기(시간)로 "다음 점검까지"를 계산해서 보여준다.
-    // 스케줄러 점검 간격(tick_minutes)/소스 주기/키워드 주기가 실제로 어떻게
-    // 맞물려 도는지 화면에서 바로 체감할 수 있게 하기 위함.
-    const formatNextCheck = (lastAt, hours) => {
-        if (!lastAt) return '대기 중 (다음 틱에 점검)';
-        const next = new Date(new Date(lastAt).getTime() + hours * 3600 * 1000);
-        const diffMin = Math.round((next - new Date()) / 60000);
-        if (diffMin <= 0) return '대기 중 (다음 틱에 점검)';
-        return diffMin < 60 ? `${diffMin}분 후` : `${(diffMin / 60).toFixed(1)}시간 후`;
     };
 
     const handleExportToVault = async (articleId, folder, filename, content) => {
@@ -1050,7 +846,7 @@ function App() {
     // ============================================
     return (
         <div className="app-container">
-            <Toaster 
+            <Toaster
                 position="top-right"
                 toastOptions={{
                     duration: 3000,
@@ -1188,78 +984,69 @@ function App() {
                 </div>
             )}
 
-            <div className="control-panel">
-                <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
-                    {/* 검색어 입력창 바로 옆에 실시간 수집 - Enter 키로도 바로 실행되도록 한 폼으로 묶음 */}
-                    <form onSubmit={handleRealtimeSubmit} className="search-form">
-                        <input 
-                            type="text" 
-                            placeholder="검색어 입력 (예: 테슬라, AI, 정치)" 
-                            value={keyword} 
-                            onChange={(e) => setKeyword(e.target.value)}
-                            onBlur={handleKeywordInputBlur}
-                        />
-                        <button type="submit" className="collect-btn">
-                            {pipelinePending ? '⏹ 중단 (클릭)' : '⚡ 실시간 수집'}
-                        </button>
-                    </form>
-
-                    <GenrePreferenceSelector />
-
-                    {/* 검색주기설정: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
-                        저장을 눌러야 실제로 반영된다 (8/7 세션 후반 - 상시 노출 대신 토글로 변경) */}
-                    <div style={{ position: 'relative' }}>
-                        <button
-                            type="button"
-                            className="collect-btn"
-                            style={{ backgroundColor: showIntervalPopover ? '#0d9488' : '#14b8a6' }}
-                            onClick={() => setShowIntervalPopover(!showIntervalPopover)}
-                        >
-                            ⏱️ 검색주기설정
-                        </button>
-
-                        {showIntervalPopover && (
-                            <form onSubmit={handleSetSearchInterval} className="search-collect-options-popover">
-                                <label>
-                                    최근
-                                    <input
-                                        type="number"
-                                        min="1"
-                                        value={monthsBack}
-                                        onChange={(e) => setMonthsBack(Number(e.target.value))}
-                                    />
-                                    개월 이내 자료
-                                </label>
-                                <label>
-                                    <input
-                                        type="number"
-                                        min="1"
-                                        value={intervalHours}
-                                        onChange={(e) => setIntervalHours(Number(e.target.value))}
-                                    />
-                                    시간마다 재수집
-                                </label>
-                                <button type="submit" className="search-btn">
-                                    저장
-                                </button>
-                            </form>
-                        )}
-                    </div>
-                </div>
-
-                <div style={{ display: 'flex', gap: '10px', marginLeft: 'auto' }}>
-
-                    <GenreEditor />
-
+            {/* 2026-08-10: 두 줄이었던 걸 한 줄로 병합 (출처관리/출처평가가 장르편집기
+                탭 안으로 옮겨가면서 버튼 수가 줄어 한 줄에 다 들어갈 여유가 생김) */}
+            <div className="control-panel" style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                <form onSubmit={handleRealtimeSubmit} className="search-form">
+                    <input 
+                        type="text" 
+                        placeholder="검색어 입력 (예: 테슬라, AI, 정치)" 
+                        value={keyword} 
+                        onChange={(e) => setKeyword(e.target.value)}
+                        onBlur={handleKeywordInputBlur}
+                    />
                     <button
+                        type="submit"
                         className="collect-btn"
-                        style={{ backgroundColor: showSourceManager ? '#7c3aed' : '#8b5cf6' }}
-                        onClick={handleToggleSourceManager}
+                        style={{ backgroundColor: pipelinePending ? '#991b1b' : '#ef4444' }}
                     >
-                        ⚙️ 출처 관리
+                        {pipelinePending ? '⏹ 중단 (클릭)' : '⚡ 실시간 수집'}
                     </button>
-                    <SourceEvaluation />
+                </form>
+
+                <GenrePreferenceSelector />
+
+                {/* 검색주기설정: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
+                    저장을 눌러야 실제로 반영된다 (8/7 세션 후반 - 상시 노출 대신 토글로 변경) */}
+                <div style={{ position: 'relative' }}>
+                    <button
+                        type="button"
+                        className="collect-btn"
+                        style={{ backgroundColor: showIntervalPopover ? '#6d28d9' : '#8b5cf6' }}
+                        onClick={() => setShowIntervalPopover(!showIntervalPopover)}
+                    >
+                        ⏱️ 검색주기설정
+                    </button>
+
+                    {showIntervalPopover && (
+                        <form onSubmit={handleSetSearchInterval} className="search-collect-options-popover">
+                            <label>
+                                최근
+                                <input
+                                    type="number"
+                                    min="1"
+                                    value={monthsBack}
+                                    onChange={(e) => setMonthsBack(Number(e.target.value))}
+                                />
+                                개월 이내 자료
+                            </label>
+                            <label>
+                                <input
+                                    type="number"
+                                    min="1"
+                                    value={intervalHours}
+                                    onChange={(e) => setIntervalHours(Number(e.target.value))}
+                                />
+                                시간마다 재수집
+                            </label>
+                            <button type="submit" className="search-btn">
+                                저장
+                            </button>
+                        </form>
+                    )}
                 </div>
+
+                <GenreEditor />
             </div>
 
             {message && (
@@ -1271,304 +1058,23 @@ function App() {
             )}
 
 
-            {showSourceManager && (
-                <div className="source-manager-panel">
-                    <div className="scheduler-config-row">
-                        <span title="이 값은 '몇 시에 시계를 볼지'이고, 아래 각 소스/키워드의 주기(시간)는 '실제로 얼마 만에 한 번씩 도는지'입니다. 스케줄러 점검 간격이 가장 짧은 주기보다 크면 그 항목은 정시에 안 돕니다.">
-                            스케줄러 점검 간격 (ⓘ 소스/키워드별 주기보다 짧아야 함):
-                        </span>
-                        <input
-                            type="number"
-                            min="1"
-                            value={tickMinutes}
-                            onChange={(e) => setTickMinutes(Number(e.target.value))}
-                            style={{ width: '70px' }}
-                        />
-                        <span>분마다</span>
-                        <button onClick={handleUpdateTickMinutes} className="scheduler-config-save">저장</button>
-                    </div>
-
-                    <div className="source-manager-add">
-                        <input
-                            placeholder="이름"
-                            value={newSource.name}
-                            onChange={(e) => setNewSource({ ...newSource, name: e.target.value })}
-                        />
-                        <input
-                            placeholder="URL"
-                            value={newSource.url}
-                            onChange={(e) => setNewSource({ ...newSource, url: e.target.value })}
-                        />
-                        <input
-                            placeholder="카테고리(선택)"
-                            value={newSource.category}
-                            onChange={(e) => setNewSource({ ...newSource, category: e.target.value })}
-                        />
-                        <input
-                            type="number"
-                            placeholder="주기(시간)"
-                            value={newSource.interval_hours}
-                            onChange={(e) => setNewSource({ ...newSource, interval_hours: Number(e.target.value) })}
-                            style={{ width: '70px' }}
-                        />
-                        <button onClick={handleAddSource}>+ 직접 추가</button>
-                    </div>
-
-                    <div className="source-manager-list">
-                        <div className="source-filter-bar">
-                            <button
-                                className={`source-filter-chip ${!categoryFilter && !showFailingOnly ? 'active' : ''}`}
-                                onClick={() => { setCategoryFilter(null); setShowFailingOnly(false); }}
-                            >
-                                전체 ({sourcesList.length})
-                            </button>
-                            {getCategoryCounts(sourcesList).map(({ category, count }) => (
-                                <button
-                                    key={category}
-                                    className={`source-filter-chip ${categoryFilter === category ? 'active' : ''}`}
-                                    onClick={() => {
-                                        setShowFailingOnly(false);
-                                        setCategoryFilter((prev) => (prev === category ? null : category));
-                                    }}
-                                >
-                                    {category} ({count})
-                                </button>
-                            ))}
-                            <button
-                                className={`source-filter-chip source-filter-chip-warning ${showFailingOnly ? 'active' : ''}`}
-                                onClick={() => {
-                                    setCategoryFilter(null);
-                                    setShowFailingOnly((prev) => !prev);
-                                }}
-                            >
-                                ⚠️ 탈락 후보 ({sourcesList.filter(isFailingCandidate).length})
-                            </button>
-                        </div>
-
-                        {(() => {
-                            const filtered = applySourceFilters(sourcesList, categoryFilter, showFailingOnly);
-                            if (filtered.length === 0) {
-                                return (
-                                    <p style={{ margin: 0, color: '#94a3b8' }}>
-                                        {sourcesList.length === 0
-                                            ? '등록된 소스가 없습니다.'
-                                            : '이 필터에 해당하는 소스가 없습니다.'}
-                                    </p>
-                                );
-                            }
-
-                            return (
-                                <div className="source-table-scroll">
-                                    <table className="source-table">
-                                        <colgroup>
-                                            <col style={{ width: '110px' }} />  {/* 카테고리 */}
-                                            <col style={{ width: '22%' }} />    {/* 소스 */}
-                                            <col style={{ width: '60px' }} />   {/* 건수 */}
-                                            <col style={{ width: '64px' }} />   {/* 구분 */}
-                                            <col />                              {/* URL - 남는 공간 전부 */}
-                                            <col style={{ width: '70px' }} />   {/* 주기 */}
-                                            <col style={{ width: '56px' }} />   {/* 삭제 */}
-                                        </colgroup>
-                                        <thead>
-                                            <tr>
-                                                <th>카테고리</th>
-                                                <th>소스</th>
-                                                <th>건수</th>
-                                                <th>구분</th>
-                                                <th>URL</th>
-                                                <th>주기</th>
-                                                <th></th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {groupSourcesByCategory(filtered).map((group) => {
-                                                const isCollapsed = collapsedCategories.has(group.category);
-                                                const hasFailing = group.sources.some(isFailingCandidate);
-
-                                                const toggleCollapse = () => {
-                                                    setCollapsedCategories((prev) => {
-                                                        const next = new Set(prev);
-                                                        if (next.has(group.category)) {
-                                                            next.delete(group.category);
-                                                        } else {
-                                                            next.add(group.category);
-                                                        }
-                                                        return next;
-                                                    });
-                                                };
-
-                                                if (isCollapsed) {
-                                                    return (
-                                                        <tr key={group.category} className="source-table-category-row-collapsed">
-                                                            <td
-                                                                className="source-table-category"
-                                                                colSpan={7}
-                                                                onClick={toggleCollapse}
-                                                                style={{ cursor: 'pointer' }}
-                                                            >
-                                                                <span className="source-table-category-toggle">▶</span>
-                                                                {group.category}
-                                                                {isSensitiveCategory(group) && (
-                                                                    <span
-                                                                        className="source-table-sensitive-badge"
-                                                                        title="민감 카테고리 — 개인화 프로필에서 결론 유도가 아닌 정보 필터링 용도로만 사용"
-                                                                    >
-                                                                        ⚠️
-                                                                    </span>
-                                                                )}
-                                                                {hasFailing && (
-                                                                    <span
-                                                                        className="source-table-category-failing-badge"
-                                                                        title="이 카테고리에 탈락 후보(연속 3회 이상 실패)가 포함되어 있습니다"
-                                                                    >
-                                                                        ⚠️
-                                                                    </span>
-                                                                )}
-                                                                <span className="source-table-category-count">
-                                                                    {group.sources.length}개 · 펼치려면 클릭
-                                                                </span>
-                                                            </td>
-                                                        </tr>
-                                                    );
-                                                }
-
-                                                return group.sources.map((src, idx) => (
-                                                    <tr
-                                                        key={src.id}
-                                                        className={src.status === 'failing' ? 'source-row-failing' : ''}
-                                                    >
-                                                        {idx === 0 && (
-                                                            <td
-                                                                className="source-table-category"
-                                                                rowSpan={group.sources.length}
-                                                                onClick={toggleCollapse}
-                                                                style={{ cursor: 'pointer' }}
-                                                            >
-                                                                <span className="source-table-category-toggle">▼</span>
-                                                                {group.category}
-                                                                {isSensitiveCategory(group) && (
-                                                                    <span
-                                                                        className="source-table-sensitive-badge"
-                                                                        title="민감 카테고리 — 개인화 프로필에서 결론 유도가 아닌 정보 필터링 용도로만 사용"
-                                                                    >
-                                                                        ⚠️
-                                                                    </span>
-                                                                )}
-                                                                {hasFailing && (
-                                                                    <span
-                                                                        className="source-table-category-failing-badge"
-                                                                        title="이 카테고리에 탈락 후보(연속 3회 이상 실패)가 포함되어 있습니다"
-                                                                    >
-                                                                        ⚠️
-                                                                    </span>
-                                                                )}
-                                                                <span className="source-table-category-count">
-                                                                    {group.sources.length}개
-                                                                </span>
-                                                            </td>
-                                                        )}
-                                                        <td className="source-table-name">
-                                                            {src.name}
-                                                            {src.status === 'failing' && (
-                                                                <span className="source-row-warning">
-                                                                    {' '}⚠️ 연속 {src.fail_count}회 실패
-                                                                </span>
-                                                            )}
-                                                        </td>
-                                                        <td className="source-table-count-cell">
-                                                            {(sourceCounts[src.name] ?? 0)}건
-                                                        </td>
-                                                        <td>
-                                                            <span
-                                                                className={`source-origin-badge ${isAutoOrigin(src.origin) ? 'auto' : 'manual'}`}
-                                                            >
-                                                                {isAutoOrigin(src.origin) ? '자동' : '수동'}
-                                                            </span>
-                                                        </td>
-                                                        <td className="source-table-url" title={src.url}>
-                                                            <a href={src.url} target="_blank" rel="noreferrer">
-                                                                {src.url}
-                                                            </a>
-                                                        </td>
-                                                        <td className="source-table-interval">
-                                                            {src.source_type === 'blocked' ? (
-                                                                <span
-                                                                    className="source-table-block-reason"
-                                                                    title="크롤링이 계속 막혀 기사를 저장하지 못한 사유"
-                                                                >
-                                                                    🚫 {src.block_reason || '차단(원인불명)'}
-                                                                </span>
-                                                            ) : (
-                                                                <>
-                                                                    <input
-                                                                        type="number"
-                                                                        min="0.5"
-                                                                        step="0.5"
-                                                                        defaultValue={src.interval_hours}
-                                                                        style={{ width: '50px', textAlign: 'right' }}
-                                                                        title={`다음 점검: ${formatNextCheck(src.last_attempt_at, src.interval_hours)}`}
-                                                                        onBlur={(e) => {
-                                                                            const v = Number(e.target.value);
-                                                                            if (v > 0 && v !== src.interval_hours) {
-                                                                                handleUpdateSourceInterval(src.id, v);
-                                                                            }
-                                                                        }}
-                                                                    />
-                                                                    <span style={{ marginLeft: '4px' }}>시간</span>
-                                                                </>
-                                                            )}
-                                                        </td>
-                                                        <td className="source-table-delete-cell">
-                                                            {confirmDeleteId === src.id ? (
-                                                                <span className="source-delete-confirm">
-                                                                    <button
-                                                                        onClick={() => handleDeleteSource(src.id)}
-                                                                        className="source-delete-confirm-yes"
-                                                                    >
-                                                                        확인
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={() => setConfirmDeleteId(null)}
-                                                                        className="source-delete-confirm-no"
-                                                                    >
-                                                                        취소
-                                                                    </button>
-                                                                </span>
-                                                            ) : (
-                                                                <button
-                                                                    onClick={() => setConfirmDeleteId(src.id)}
-                                                                    className="source-row-delete"
-                                                                >
-                                                                    🗑️
-                                                                </button>
-                                                            )}
-                                                        </td>
-                                                    </tr>
-                                                ));
-                                            })}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            );
-                        })()}
-                    </div>
-                </div>
-            )}
-
             <div className="stats-section">
                 <p>
                     총 저장된 출처: <strong>{new Set(articles.map(a => a.source)).size}건</strong> 
                     {keyword && ` (검색어: "${keyword}")`}
                 </p>
                 <div className="keyword-stats-bar">
-                    <span className="stats-label">키워드별 현황:</span>
-                    {Object.entries(keywordStats).map(([kw, count]) => (
-                        <button 
-                            key={kw} 
+                    <span className="stats-label">키워드별 현황 (중분류):</span>
+                    {keywordStats.map((group) => (
+                        <button
+                            key={group.mid_category}
                             className="stat-badge-btn"
-                            onClick={() => handleStatClick(kw)}
+                            style={expandedMidCategory === group.mid_category ? { backgroundColor: '#3b82f6', color: '#fff' } : undefined}
+                            onClick={() =>
+                                setExpandedMidCategory((prev) => (prev === group.mid_category ? null : group.mid_category))
+                            }
                         >
-                            {kw}: <strong>{count}건</strong>
+                            {group.mid_category}: <strong>{group.total_count}건</strong>
                         </button>
                     ))}
                     <button 
@@ -1581,6 +1087,20 @@ function App() {
                     </button>
                 </div>
 
+                {expandedMidCategory && (
+                    <div className="keyword-stats-bar keyword-stats-sub-bar">
+                        <span className="stats-label">└ {expandedMidCategory} 소분류:</span>
+                        {(keywordStats.find((g) => g.mid_category === expandedMidCategory)?.sub_categories || []).map((item) => (
+                            <button
+                                key={item.tag_id ?? item.label}
+                                className="stat-badge-btn stat-badge-btn-sub"
+                                onClick={() => handleStatClick(item)}
+                            >
+                                {item.label}: <strong>{item.count}건</strong>
+                            </button>
+                        ))}
+                    </div>
+                )}
                 {showKeywordManager && (
                     <div className="source-manager-panel" style={{ marginTop: '12px' }}>
                         <h4 style={{ margin: '0 0 10px 0', color: '#94a3b8', fontSize: '0.85rem' }}>

@@ -95,7 +95,7 @@ body {
    기본 레이아웃
    =================================================== */
 .app-container {
-  max-width: 1200px;
+  max-width: 100vw;
   margin: 0 auto;
   padding: 20px;
   text-align: left;
@@ -162,10 +162,10 @@ body {
 .control-panel {
   display: flex;
   gap: 10px;
-  margin-bottom: 20px;
+  margin-bottom: 10px;
   flex-wrap: wrap;
-  justify-content: flex-start;
-  align-items: center;
+  justify-content: space-between;
+  align-items: left;
 }
 
 .control-panel > div:first-child {
@@ -1294,6 +1294,11 @@ body {
     border-radius: 8px;
     padding: 16px;
     margin: 12px 0;
+    height: calc(100vh - 350px);
+    overflow-y: auto;
+    /* max-height: none;   /* 2026-08-10: 혹시 다른 규칙이 이 패널 자체의 높이를
+                           제한하고 있어서 안쪽 source-table-scroll이 다 못
+                           펼쳐지는 경우를 방지 */
 }
 
 .scheduler-config-row {
@@ -1515,8 +1520,8 @@ body {
 
 /* ── 소스 테이블 스크롤 컨테이너 ── */
 .source-table-scroll {
-    min-height: 540px;   /* 소스가 적어도 항상 8행 이상 볼 수 있는 높이는 확보 */
-    max-height: 760px;   /* 소스가 많을 때 스크롤 전까지 보이는 최대 높이 */
+    min-height: 900px;   /* 소스가 적어도 항상 8행 이상 볼 수 있는 높이는 확보 */
+    max-height: 1100px;   /* 소스가 많을 때 스크롤 전까지 보이는 최대 높이 */
     overflow-y: auto;
     border: 1px solid #334155;
     border-radius: 6px;
@@ -1591,7 +1596,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    max-height: 300px;
+    max-height: 700px;
     overflow-y: auto;
 }
 
@@ -2318,4 +2323,70 @@ body {
 .genre-editor-delete-confirm button:last-child {
   background: var(--border-color);
   color: var(--text-primary);
+}
+
+.genre-editor-inline-input {
+    width: 100%;
+    min-width: 60px;
+    background: #0f172a;
+    border: 1px solid #3b82f6;
+    border-radius: 4px;
+    padding: 4px 6px;
+    color: #f0f0f0;
+    font-size: 0.85rem;
+}
+
+.genre-editor-row-actions,
+.genre-editor-edit-actions,
+.genre-editor-delete-confirm {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.genre-editor-edit-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.genre-editor-tabs {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid #334155;
+}
+
+.genre-editor-tab {
+    background: none;
+    border: none;
+    padding: 8px 14px;
+    color: #94a3b8;
+    cursor: pointer;
+    font-size: 0.85rem;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+}
+
+.genre-editor-tab:hover {
+    color: #e2e8f0;
+}
+
+.genre-editor-tab.active {
+    color: #3b82f6;
+    border-bottom-color: #3b82f6;
+    font-weight: 600;
+}
+
+.keyword-stats-sub-bar {
+    margin-left: 20px;
+    margin-top: 4px;
+    padding-left: 12px;
+    border-left: 2px solid #334155;
+}
+
+.stat-badge-btn-sub {
+    font-size: 0.8rem;
+    opacity: 0.92;
 }

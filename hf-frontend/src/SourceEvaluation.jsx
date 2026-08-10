@@ -16,7 +16,7 @@
 // 로 불러와 "⚙️ 출처 관리" 버튼 옆에 <SourceEvaluation /> 를 렌더링하면 됩니다.
 // ---------------------------------------------------------------------------
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
@@ -38,8 +38,10 @@ function ScoreBar({ score }) {
   );
 }
 
-export default function SourceEvaluation() {
-  const [open, setOpen] = useState(false);
+export default function SourceEvaluation({ embedded = false }) {
+  // 2026-08-10: embedded=true면(장르편집기 탭 안에 끼워 넣을 때) 자체 버튼/오버레이
+  // 없이 항상 열린 상태로 내용만 렌더링한다.
+  const [open, setOpen] = useState(embedded);
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -66,6 +68,13 @@ export default function SourceEvaluation() {
     if (!data) await refresh();
   };
 
+  useEffect(() => {
+    if (embedded && !data) {
+      refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [embedded]);
+
   // 전체 장르를 합쳐 스코어 기준 내림차순 정렬 후 상위 50개만 추출.
   // 백엔드 /sources/evaluation은 장르(카테고리)별로 이미 나뉘어 오므로,
   // 여기서 한 번 펼쳐서(flat) 다시 정렬한다.
@@ -85,26 +94,22 @@ export default function SourceEvaluation() {
     return data.categories.find((c) => c.category === selectedGenre) || null;
   }, [data, selectedGenre]);
 
-  return (
+  // embedded 모드일 때 실제로 렌더링할 내용물 (버튼/오버레이/패널 껍데기 없이)
+  const content = (
     <>
-      <button onClick={handleOpen} className="source-eval-btn">
-        출처 평가
-      </button>
-
-      {open && (
-        <div className="source-eval-overlay" onClick={() => setOpen(false)}>
-          <div className="source-eval-panel" onClick={(e) => e.stopPropagation()}>
-            <div className="source-eval-header">
-              <h3>장르별 출처 평가</h3>
-              <div>
-                <button onClick={refresh} disabled={loading}>
-                  {loading ? "갱신 중..." : "새로고침"}
-                </button>
-                <button onClick={() => setOpen(false)} style={{ marginLeft: 8 }}>
-                  닫기
-                </button>
-              </div>
-            </div>
+      <div className="source-eval-header">
+        <h3>장르별 출처 평가</h3>
+        <div>
+          <button onClick={refresh} disabled={loading}>
+            {loading ? "갱신 중..." : "새로고침"}
+          </button>
+          {!embedded && (
+            <button onClick={() => setOpen(false)} style={{ marginLeft: 8 }}>
+              닫기
+            </button>
+          )}
+        </div>
+      </div>
 
             <p className="source-eval-criteria">{SCORE_CRITERIA_TEXT}</p>
 
@@ -195,6 +200,25 @@ export default function SourceEvaluation() {
                 ) : null}
               </>
             )}
+    </>
+  );
+
+  // 2026-08-10: embedded면 버튼/오버레이 껍데기 없이 content만 그대로 반환.
+  // 아니면(기존 독립 사용) 원래대로 버튼 + 오버레이 + 패널로 감싼다.
+  if (embedded) {
+    return content;
+  }
+
+  return (
+    <>
+      <button onClick={handleOpen} className="source-eval-btn">
+        출처 평가
+      </button>
+
+      {open && (
+        <div className="source-eval-overlay" onClick={() => setOpen(false)}>
+          <div className="source-eval-panel" onClick={(e) => e.stopPropagation()}>
+            {content}
           </div>
         </div>
       )}
