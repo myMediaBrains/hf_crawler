@@ -25,6 +25,7 @@ import할 때 순환참조가 생기지 않는다.
 import re
 import logging
 from sqlmodel import Session, select
+from sqlmodel import func as sql_funcv
 
 from models import Tag, TagKeyword, TagBlacklist, ArticleTag
 
@@ -38,6 +39,20 @@ _HANGUL_PATTERN = re.compile(r'[\uac00-\ud7a3]')
 
 def _contains_hangul(text: str) -> bool:
     return bool(_HANGUL_PATTERN.search(text or ""))
+
+
+def _clean_llm_short_output(raw: str) -> str:
+    """
+    LLM이 "짧은 단어 하나만 출력해"라고 지시받아도 가끔 목록 기호(-, *, •)나
+    번호(1. 2.)를 붙여서 응답하는 경우가 있다 (2026-08-10 발견 - "반도체" ->
+    "-Semiconductor"로 저장되던 버그의 원인). 따옴표 제거만으로는 안 잡히므로
+    이 패턴들도 함께 벗겨낸다. translate_keyword_en/ko 등 "짧은 결과 하나"를
+    기대하는 모든 LLM 호출 후처리에 공용으로 쓴다.
+    """
+    text = raw.strip().strip('"').strip("'").strip()
+    text = re.sub(r'^[\-\*•]+\s*', '', text)      # 목록 기호 제거
+    text = re.sub(r'^\d+[\.\)]\s*', '', text)      # "1. " "2) " 같은 번호 매기기 제거
+    return text.strip()
 
 
 def _translate_to_english_tag_name(korean_text: str) -> str:
@@ -54,7 +69,7 @@ def _translate_to_english_tag_name(korean_text: str) -> str:
     )
     try:
         raw = model_router.chat("translate_keyword_en", [{"role": "user", "content": prompt}])
-        translated = raw.strip().strip('"').strip("'")
+        translated = _clean_llm_short_output(raw)
         return translated if translated else korean_text
     except Exception as e:
         logger.warning(f"[tagging] 한글 태그명 영어 변환 실패, 원문 유지: {e}")
@@ -75,25 +90,78 @@ def get_or_create_tag(
     상황을 방지한다 (사람/LLM이 이후 동의어를 더 추가할 수 있음).
 
     2026-08-09: 이름/대분류에 한글이 섞여 있으면 자동으로 영어로 번역한다.
-    이 함수가 태그 생성의 유일한 진입점이라(장르편집기 수동 입력, 선호장르선택
-    직접입력, 채팅 자동수집, 한글 검색 전부 결국 여기를 거침), 여기 한 곳만
-    강제하면 5개 관리 화면(키워드현황/선호장르선택/장르편집기/출처관리/
-    출처평가)이 항상 영어로 표시된다는 걸 어디서 호출하든 보장할 수 있다.
+
+    2026-08-10 (1차 수정): 기존 태그를 찾으면 major/mid_category를 갱신하도록
+    변경했었는데, 이러면 "소분류 텍스트는 같지만 중분류가 다른" 별개 항목을
+    새로 만들려 할 때 기존 걸 덮어써버리는 문제가 있었다 (예: Tech>Chips가
+    이미 있는데 Food>Chips를 새로 만들려 하면, 기존 Tech>Chips가 Food로
+    바뀌어버림 - 사용자가 "입력이 안 된다"고 느낀 원인).
+
+    2026-08-10 (2차 수정, 이번 건): 이름은 같아도 중분류가 다르면 완전히
+    별개의 Tag로 분리한다. 내부 식별자(Tag.name, DB 유일해야 함)만 구분을
+    위해 살짝 다르게("Chips (Food)") 만들고, 사람이 실제로 보고 입력한 깨끗한
+    텍스트("Chips")는 label_ko 필드에 그대로 보존해서 화면 표시/검색어 조합에
+    항상 그 값을 쓴다 - 기술적 구분과 사용자 표시를 분리한 것.
     """
     if _contains_hangul(name):
         name = _translate_to_english_tag_name(name)
     if major_category and _contains_hangul(major_category):
         major_category = _translate_to_english_tag_name(major_category)
+    if mid_category and _contains_hangul(mid_category):
+        mid_category = _translate_to_english_tag_name(mid_category)
 
-    existing = session.exec(select(Tag).where(Tag.name == name)).first()
+    clean_name = name  # 사람이 실제로 입력한 원본 - 화면 표시/검색어 조합에 항상 이걸 씀
+
+    # 2026-08-10: 대소문자 무시 매칭 - GitHub 토픽은 소문자("ai")로 오는데
+    # 뉴스 태그는 대문자("AI")로 등록돼 있어서, 정확히 같은 문자열만 매칭하면
+    # 서로 다른 태그로 쪼개져 "뉴스와 GitHub가 태그를 공유한다"는 목표가
+    # 깨지는 문제가 있었다.
+    existing = session.exec(
+        select(Tag).where(sql_func.lower(Tag.name) == name.lower())
+    ).first()
+
+    if existing and mid_category and existing.mid_category and existing.mid_category != mid_category:
+        # 이름은 같지만 중분류가 다른 별개 주제 - 기술적 이름만 구분해서 새로 만든다.
+        disambiguated_name = f"{name} ({mid_category})"
+        existing2 = session.exec(select(Tag).where(Tag.name == disambiguated_name)).first()
+        if existing2:
+            return existing2
+        tag = Tag(
+            name=disambiguated_name,
+            major_category=major_category,
+            mid_category=mid_category,
+            label_ko=clean_name,  # 화면엔 항상 이 값을 보여줌
+            sensitive=sensitive,
+        )
+        session.add(tag)
+        session.commit()
+        session.refresh(tag)
+        # 검색 매칭용 TagKeyword는 사람이 실제로 보는 깨끗한 이름 그대로 등록
+        session.add(TagKeyword(tag_id=tag.id, term=clean_name))
+        session.commit()
+        logger.info(f"[tagging] 중분류 충돌로 별도 태그 생성: '{disambiguated_name}' (표시명: '{clean_name}')")
+        return tag
+
     if existing:
+        changed = False
+        if major_category and existing.major_category != major_category:
+            existing.major_category = major_category
+            changed = True
+        if mid_category and existing.mid_category != mid_category:
+            existing.mid_category = mid_category
+            changed = True
+        if changed:
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+            logger.info(f"[tagging] 기존 태그 분류 갱신: '{existing.name}' ({existing.major_category} > {existing.mid_category})")
         return existing
 
     tag = Tag(
         name=name,
         major_category=major_category,
         mid_category=mid_category,
-        label_ko=label_ko,
+        label_ko=label_ko or clean_name,
         sensitive=sensitive,
     )
     session.add(tag)
@@ -105,7 +173,6 @@ def get_or_create_tag(
 
     logger.info(f"[tagging] 신규 태그 생성: '{name}' ({major_category})")
     return tag
-
 
 def _compile_all_patterns(session: Session) -> dict[int, list[re.Pattern]]:
     """
@@ -204,3 +271,15 @@ def assign_tags_to_article(
     if created:
         session.commit()
     return created
+
+def display_name_for_tag(tag: Tag) -> str:
+    """
+    화면 표시용 태그 이름. 소분류 중복 방지로 내부 이름이 구분된 태그(label_ko가
+    Tag.name과 다름)는 "중분류(소분류)" 형식으로 보여주고, 아니면 원래 이름 그대로
+    보여준다 (2026-08-10). 예: Travel 아래 Worldwide가 다른 대분류의 Worldwide와
+    겹쳐서 내부적으로 "Worldwide (Travel)"로 구분됐다면 -> 화면엔 "Travel(Worldwide)".
+    """
+    clean = tag.label_ko or tag.name
+    if tag.name != clean and tag.mid_category:
+        return f"{tag.mid_category}({clean})"
+    return clean

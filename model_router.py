@@ -202,6 +202,40 @@ TASK_PROFILES: dict[str, dict] = {
             "presence_penalty": 0.0,
         },
     },
+    "summarize_readme": {
+        # GitHub README를 2~3문장 한국어 요약으로 압축. 짧은 출력이라 LIGHT 티어로 충분.
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 200,
+            "num_ctx": 4096,
+            "presence_penalty": 0.3,
+        },
+    },
+    "translate_keyword_en": {
+        # 2026-08-09: 한글 태그/키워드 이름을 짧은 영어로 압축 번역.
+        # tagging.py의 get_or_create_tag()와 main.py의 지역 강제 검색에서 사용.
+        # 이 프로필이 빠져있어서 그동안 한글 태그명이 들어올 때마다
+        # ValueError(등록되지 않은 task 프로필)가 나고 있었을 것으로 추정됨.
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 32,
+            "num_ctx": 512,
+            "presence_penalty": 0.0,
+        },
+    },
+    "translate_keyword_ko": {
+        # 2026-08-09: 검색 지역 강제 기능 - 영어 검색어를 한국 지역 검색용
+        # 한글로 번역할 때 사용 (translate_keyword_en의 반대 방향).
+        "tier": ModelTier.LIGHT,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 32,
+            "num_ctx": 512,
+            "presence_penalty": 0.0,
+        },
+    },
     "extract_keyword": {
         # 채팅 질문(한국어일 수 있음)을 영어 뉴스 검색용 짧은 키워드로 압축.
         # 이 프로젝트의 소스가 영어권 전용(hl=en-US&gl=US)이라, 한국어 질문 원문을
@@ -212,6 +246,17 @@ TASK_PROFILES: dict[str, dict] = {
             "num_predict": 24,
             "num_ctx": 1024,
             "presence_penalty": 0.0,
+        },
+    },
+    "analyze_repo_detail": {
+        # GitHub 레포 상세 화면(1·2단계 데이터 동시 생성)용. 문단 여러 개를
+        # 만들어야 해서 HEAVY 티어 + 넉넉한 num_predict.
+        "tier": ModelTier.HEAVY,
+        "options": {
+            "temperature": 0.4,
+            "num_predict": 1200,
+            "num_ctx": 8192,
+            "presence_penalty": 0.3,
         },
     },
 }

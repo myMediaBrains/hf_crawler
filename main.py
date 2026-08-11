@@ -42,6 +42,8 @@ from statistics import mean
 import priority
 import delivery as delivery_channels
 
+import github_repository
+
 # 환경 변수 로드
 load_dotenv()
 
@@ -58,6 +60,8 @@ from models import (
     Article, Translation, Keyword, Source, CandidateSource, SchedulerConfig,
     SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin, BlockedDomain,
     User, TextGeneration, Delivery, Tag, TagKeyword, TagBlacklist, ArticleTag, TagRelation,
+    GitHubRepo, GitHubRepoSnapshot, GitHubReadmeHistory, GitHubRepoTag,
+    InteractionSignal,
 )
 import tagging
 
@@ -229,6 +233,7 @@ async def lifespan(app: FastAPI):
     migrate_db.migrate_translations(DB_NAME)
     migrate_db.migrate_interaction_signals(DB_NAME)
     migrate_db.migrate_text_generations(DB_NAME)
+    migrate_db.migrate_github_repos(DB_NAME)
     logger.info("📊 데이터베이스 테이블이 준비되었습니다.")
 
     scheduler_module.seed_manual_sources(TARGET_SOURCES)
@@ -344,7 +349,8 @@ def _split_paragraph_into_sentences(paragraph: str, source_lang: str = "en") -> 
     return [p.strip() for p in parts if p.strip()]
 
 
-def _segment_article_for_translation(content: str, source_lang: str = "en") -> list[dict]:    """
+def _segment_article_for_translation(content: str, source_lang: str = "en") -> list[dict]:    
+    """
     기사 본문을 번역 파이프라인이 순서대로 처리할 세그먼트 목록으로 쪼갠다.
     각 세그먼트: {"type": "translate" | "verbatim", "text": str, "paragraph_end": bool}
 
@@ -556,10 +562,192 @@ def fix_article_source_names(session: Session = Depends(get_session)):
         "message": f"{fixed_count}건의 기사 출처 표기를 정정했습니다."
     }
 
+@app.post("/admin/backfill-source-tags")
+def backfill_source_tags(session: Session = Depends(get_session)):
+    """
+    일회성 관리 작업 - tag_id가 비어서 '미분류'로 뜨는 기존 출처를 복구한다.
+    1순위: 연결된 keyword_id가 있고 그 키워드에 tag_id가 있으면 그대로 물려받음
+           (자동 승격된 소스가 원본 키워드와 다시 정확히 일치하게 됨).
+    2순위: Source.name이 "[카테고리] 표시이름" 형식이면(고정 RSS 소스, 또는
+           승격 시점에 이미 이 형식으로 저장된 이름) 대괄호 안 문자열을 대분류로
+           추출해서 태그를 만들거나 재사용한다.
+    """
+    sources = session.exec(select(Source).where(Source.tag_id.is_(None))).all()
+    fixed = 0
+
+    for s in sources:
+        tag_id = None
+
+        if s.keyword_id:
+            kw = session.get(Keyword, s.keyword_id)
+            if kw and kw.tag_id:
+                tag_id = kw.tag_id
+
+        if tag_id is None:
+            m = re.match(r'^\[(.+?)\]', s.name or "")
+            if m:
+                category = m.group(1).strip()
+                if category:
+                    tag = tagging.get_or_create_tag(session, name=category, major_category=category)
+                    tag_id = tag.id
+
+        if tag_id:
+            s.tag_id = tag_id
+            session.add(s)
+            fixed += 1
+
+    session.commit()
+    return {
+        "status": "success",
+        "fixed": fixed,
+        "checked": len(sources),
+        "message": f"미분류 출처 {len(sources)}건 중 {fixed}건의 분류를 복구했습니다.",
+    }
+
+@app.post("/admin/sync-sources-to-genres")
+def sync_sources_to_genres(session: Session = Depends(get_session)):
+    """
+    출처관리에는 있지만 아직 장르편집기(Keyword 테이블)엔 없는 소스를 자동 등록.
+    Source.name의 대괄호 텍스트(예: "[Golf] Golf.com"의 "Golf")를 소분류로,
+    그 값을 중분류로 재배치한다. 이미 다른 곳에서 그 값이 중분류로 쓰이고
+    있으면 그 대분류를 물려받고, 없으면 "미분류"로 표시한다.
+
+    keyword_id가 이미 있는 소스(키워드 검색으로 발견/승격된 것)는 이미 자기
+    키워드를 통해 장르편집기에 올라가 있으므로 대상에서 제외한다.
+    """
+    sources = session.exec(select(Source).where(Source.keyword_id.is_(None))).all()
+    created, skipped = 0, 0
+
+    for s in sources:
+        m = re.match(r'^\[(.+?)\]', s.name or "")
+        if not m:
+            skipped += 1
+            continue
+        word = m.group(1).strip()
+        if not word:
+            skipped += 1
+            continue
+
+        existing_kw = session.exec(select(Keyword).where(Keyword.name == word)).first()
+        if existing_kw:
+            skipped += 1
+            continue
+
+        # 이 값이 이미 다른 태그의 중분류로 쓰이고 있으면 그 대분류를 물려받는다
+        matched_major = session.exec(
+            select(Tag.major_category).where(Tag.mid_category == word)
+        ).first()
+        major = matched_major if matched_major else "미분류"
+
+        tag = tagging.get_or_create_tag(session, name=word, major_category=major, mid_category=word)
+
+        keyword = Keyword(
+            name=tag.name,
+            tag_id=tag.id,
+            months_back=1,
+            interval_hours=s.interval_hours or 24.0,
+        )
+        session.add(keyword)
+        session.commit()
+        session.refresh(keyword)
+
+        s.tag_id = tag.id  # 이 소스도 방금 정리된 태그로 다시 연결
+        session.add(s)
+        session.commit()
+        created += 1
+
+    return {
+        "status": "success",
+        "created": created,
+        "skipped": skipped,
+        "message": f"{created}건을 장르편집기에 새로 등록했습니다 ({skipped}건은 이미 있거나 대상 아님)."
+    }
+
+@app.post("/admin/purge-orphaned-tags")
+def purge_orphaned_tags(session: Session = Depends(get_session)):
+    """
+    일회성 정리 - 실제 기사가 없는데 남아있는 ArticleTag(유령 연결)를 전부 지운다.
+    지금까지 기사 삭제 시 ArticleTag를 안 지웠던 버그(2026-08-10 수정)로 이미
+    쌓인 찌꺼기를 청소하는 용도. 한 번만 호출하면 됨.
+    """
+    existing_article_ids = set(session.exec(select(Article.id)).all())
+    all_links = session.exec(select(ArticleTag)).all()
+    orphaned = [link for link in all_links if link.article_id not in existing_article_ids]
+
+    for link in orphaned:
+        session.delete(link)
+    session.commit()
+
+    return {
+        "status": "success",
+        "purged": len(orphaned),
+        "message": f"유령 태그 연결 {len(orphaned)}건을 정리했습니다.",
+    }
+    
+@app.post("/admin/merge-duplicate-tags")
+def merge_duplicate_tags(session: Session = Depends(get_session)):
+    """
+    일회성 정리 - 대소문자만 다른 중복 태그(예: "AI"/"ai")를 하나로 병합한다.
+    2026-08-10 대소문자 무시 매칭 패치 이전에 이미 생긴 중복을 청소하는 용도.
+    먼저 생성된(created_at이 빠른) 쪽을 대표로 남기고, 나머지는 참조를
+    전부 옮긴 뒤 삭제한다.
+    """
+    all_tags = session.exec(select(Tag)).all()
+    groups: dict[str, list[Tag]] = {}
+    for tag in all_tags:
+        groups.setdefault(tag.name.lower(), []).append(tag)
+
+    merged = 0
+    for lower_name, tags in groups.items():
+        if len(tags) < 2:
+            continue
+        tags.sort(key=lambda t: t.created_at)
+        keep = tags[0]
+        for dup in tags[1:]:
+            session.exec(
+                select(ArticleTag).where(ArticleTag.tag_id == dup.id)
+            )
+            for row in session.exec(select(ArticleTag).where(ArticleTag.tag_id == dup.id)).all():
+                row.tag_id = keep.id
+                session.add(row)
+            for row in session.exec(select(GitHubRepoTag).where(GitHubRepoTag.tag_id == dup.id)).all():
+                row.tag_id = keep.id
+                session.add(row)
+            for row in session.exec(select(TagKeyword).where(TagKeyword.tag_id == dup.id)).all():
+                session.delete(row)
+            for row in session.exec(select(InteractionSignal).where(InteractionSignal.tag_id == dup.id)).all():
+                row.tag_id = keep.id
+                session.add(row)
+
+            keyword_row = session.exec(select(Keyword).where(Keyword.tag_id == dup.id)).first()
+            if keyword_row:
+                keyword_row.tag_id = keep.id
+                session.add(keyword_row)
+
+            session.delete(dup)
+            merged += 1
+
+    session.commit()
+    return {
+        "status": "success",
+        "merged": merged,
+        "message": f"대소문자만 다른 중복 태그 {merged}건을 병합했습니다.",
+    }
 
 # ============================================
-# 개인화 프로필 API (신규)
+# GitHub README
 # ============================================
+@app.post("/admin/reanalyze-github-repos")
+def reanalyze_github_repos(session: Session = Depends(get_session)):
+    """일회성 - 기존 분석을 전부 지우고 새 기준(내 플랫폼 연관성)으로 재생성한다."""
+    repos = session.exec(select(GitHubRepo)).all()
+    count = 0
+    for repo in repos:
+        repo.analysis_hash = None  # 강제로 재생성 트리거
+        session.add(repo)
+        count += 1
+    session.commit()
+    return {"status": "success", "message": f"{count}건을 다음 상세 조회 시 재분석하도록 초기화했습니다."}
 
 # ============================================
 # 사용자 프로필 API (신규)
@@ -792,7 +980,7 @@ async def study_translate_article_stream(
 
     # 2026-08-09: 번역 버튼 양방향화 - 동기 엔드포인트(study_translate_article)와
     # 동일한 언어 감지 로직.
-    ssource_lang = "ko" if tagging._contains_hangul(article.content or "") else "en"
+    source_lang = "ko" if tagging._contains_hangul(article.content or "") else "en"
     if source_lang == "ko":
         task = "translate_sentence_literal_ko_en" if mode == "literal" else "translate_sentence_natural_ko_en"
     else:
@@ -958,14 +1146,19 @@ def _collect_single_keyword(
     keyword = session.exec(select(Keyword).where(Keyword.name == canonical_name)).first()
     auto_registered = False
     if not keyword:
-        tag_id = None
-        if major_category:
-            tag = tagging.get_or_create_tag(session, name=canonical_name, major_category=major_category)
-            tag_id = tag.id
+        # 2026-08-10: major_category가 없으면(검색창에 직접 입력해서 등록하는
+        # 가장 흔한 경로) tag_id가 계속 None으로 남아, 나중에 이 키워드가 소스로
+        # 자동 승격될 때도 "미분류"로 남는 근본 원인이었다. 명시된 대분류가 없으면
+        # 키워드 이름 자체를 대분류로 써서, 항상 최소한의 분류는 갖도록 보장한다
+        # (다른 고정 대분류에 속한 태그가 이미 있으면 tagging.get_or_create_tag가
+        # 그걸 재사용하므로 무의미하게 늘어나지 않는다).
+        tag = tagging.get_or_create_tag(
+            session, name=canonical_name, major_category=major_category or canonical_name
+        )
 
         keyword = Keyword(
             name=canonical_name,
-            tag_id=tag_id,
+            tag_id=tag.id,
             search_query=search_query,
             language=language,
             months_back=months_back,
@@ -1023,7 +1216,8 @@ def _translate_text_llm(task: str, text: str) -> str:
     prompt = f"다음 문구를 번역해줘. 번역 결과만 출력하고 다른 설명은 붙이지 마: \"{text}\""
     try:
         raw = model_router.chat(task, [{"role": "user", "content": prompt}])
-        return raw.strip().strip('"').strip("'") or text
+        # tagging._clean_llm_short_output()과 동일한 정리(목록기호/번호 제거) 적용
+        return tagging._clean_llm_short_output(raw) or text
     except Exception as e:
         logger.warning(f"[collect] 번역 실패({task}), 원문 유지: {e}")
         return text
@@ -1085,6 +1279,84 @@ def collect_deep_incremental(
             f"(신규 {stats['keywords_new_articles']}건)."
         )
     }
+
+
+class GitHubCollectRequest(BaseModel):
+    query: str
+    max_entries: int = 10
+
+
+@app.post("/collect/github")
+def collect_github(request: GitHubCollectRequest, session: Session = Depends(get_session)):
+    """
+    GitHub Search API로 레포를 발굴/재수집한다. query 예시: "rag stars:>500",
+    "language:python topic:llm" 등 GitHub 검색 문법 그대로 사용 가능.
+    """
+    count = github_repository.discover_and_collect(session, request.query, max_entries=request.max_entries)
+    return {
+        "status": "success",
+        "message": f"'{request.query}' 검색으로 {count}건 처리했습니다.",
+    }
+
+from datetime import timedelta
+
+@app.get("/github/repos")
+def list_github_repos_table(session: Session = Depends(get_session)):
+    """1단계 - 표(분야/오픈소스/스타수/응용분야/연관성/구성요소), 단어 위주."""
+    repos = session.exec(select(GitHubRepo).order_by(GitHubRepo.full_name)).all()
+    result = []
+    for repo in repos:
+        latest_snapshot = session.exec(
+            select(GitHubRepoSnapshot).where(GitHubRepoSnapshot.repo_id == repo.id)
+            .order_by(GitHubRepoSnapshot.snapshot_at.desc())
+        ).first()
+        result.append({
+            "id": repo.id,
+            "field": repo.field_short or repo.primary_language or "-",
+            "full_name": repo.full_name,
+            "stars": latest_snapshot.stars if latest_snapshot else 0,
+            "application": repo.application_short or "-",
+            "relevance": repo.relevance_short or "-",
+            "components": repo.components_short or repo.primary_language or "-",
+        })
+    result.sort(key=lambda r: -r["stars"])
+    return {"repos": result}
+
+
+@app.get("/github/repos/{repo_id}/detail")
+def get_github_repo_detail(repo_id: int, session: Session = Depends(get_session)):
+    """2단계 - 상세. 필요하면 이 시점에 LLM 분석을 생성(지연 생성+캐시)."""
+    repo = github_repository.get_or_generate_detail(session, repo_id)
+    if repo is None:
+        raise HTTPException(status_code=404, detail="해당 레포를 찾을 수 없습니다.")
+
+    latest_snapshot = session.exec(
+        select(GitHubRepoSnapshot).where(GitHubRepoSnapshot.repo_id == repo.id)
+        .order_by(GitHubRepoSnapshot.snapshot_at.desc())
+    ).first()
+
+    return {
+        "id": repo.id,
+        "full_name": repo.full_name,
+        "url": repo.url,
+        "created_at_github": repo.created_at_github,
+        "pushed_at_github": repo.pushed_at_github,
+        "stars": latest_snapshot.stars if latest_snapshot else 0,
+        "forks": latest_snapshot.forks if latest_snapshot else 0,
+        "detailed_overview": repo.detailed_overview,
+        "detailed_application": repo.detailed_application,
+        "detailed_relations": repo.detailed_relations,
+        "future_direction": repo.future_direction,
+    }
+
+
+@app.get("/github/repos/{repo_id}/readme")
+def get_github_repo_readme(repo_id: int, session: Session = Depends(get_session)):
+    """3단계 - 원본 README 그대로."""
+    repo = session.get(GitHubRepo, repo_id)
+    if repo is None:
+        raise HTTPException(status_code=404, detail="해당 레포를 찾을 수 없습니다.")
+    return {"id": repo.id, "full_name": repo.full_name, "readme_content": repo.readme_content or ""}
 
 
 
@@ -1240,13 +1512,26 @@ def delete_keyword(keyword_id: int, session: Session = Depends(get_session)):
     articles_to_delete = session.exec(select(Article).where(Article.keyword == name)).all()
     deleted_count = len(articles_to_delete)
     for article in articles_to_delete:
+        # 2026-08-10: 기사 삭제 시 ArticleTag(다중 태그 연결)도 함께 정리 -
+        # delete_article()과 동일한 이유(유령 연결로 인한 건수/조회 불일치 방지).
+        tag_links = session.exec(select(ArticleTag).where(ArticleTag.article_id == article.id)).all()
+        for link in tag_links:
+            session.delete(link)
         session.delete(article)
+
+    # 2026-08-10 버그 수정: 이 키워드로 자동 승격된 출처(Source.keyword_id로
+    # 연결)도 함께 삭제한다. 예전엔 키워드만 지워지고 승격된 출처는 그대로 남아,
+    # 삭제한 키워드가 백그라운드 크롤링(스케줄러 틱)에 계속 포함되는 버그가 있었다.
+    linked_sources = session.exec(select(Source).where(Source.keyword_id == keyword.id)).all()
+    deleted_sources = len(linked_sources)
+    for src in linked_sources:
+        session.delete(src)
 
     session.delete(keyword)
     session.commit()
     return {
         "status": "success",
-        "message": f"'{name}' 키워드와 수집된 기사 {deleted_count}건을 함께 삭제했습니다."
+        "message": f"'{name}' 키워드와 수집된 기사 {deleted_count}건, 연결된 출처 {deleted_sources}건을 함께 삭제했습니다."
     }
 
 # 3-1-5. 장르(대분류/중분류/소분류) 등록 - '장르 편집기' 버튼 전용.
@@ -1301,20 +1586,120 @@ def list_genres(session: Session = Depends(get_session)):
     keywords = session.exec(select(Keyword)).all()
     result = []
 
+    # 2026-08-10: 건수 계산을 Article.keyword(검색 수집분만 채워짐) 대신
+    # ArticleTag(수집 경로 불문하고 저장 시점에 항상 부여됨) 기준으로 전환.
+    # RSS 고정 소스로 들어온 기사는 Article.keyword가 항상 비어있어서, 이전
+    # 방식으로는 "Golf" 같은(출처관리에서 동기화된) 항목이 실제로 골프 기사가
+    # 쌓여도 건수가 0으로 나오던 버그의 원인이었다. tag_id별로 한 번에 집계해서
+    # 키워드마다 개별 쿼리를 반복하지 않는다.
+    tag_counts = dict(
+        session.exec(
+            select(ArticleTag.tag_id, sql_func.count(ArticleTag.id)).group_by(ArticleTag.tag_id)
+        ).all()
+    )
+
     for k in keywords:
-        article_count = len(session.exec(select(Article).where(Article.keyword == k.name)).all())
+        if k.tag_id and k.tag_id in tag_counts:
+            article_count = tag_counts[k.tag_id]
+        else:
+            # tag_id가 아직 없는 예외적인 경우를 위한 안전망(하위호환)
+            article_count = len(session.exec(select(Article).where(Article.keyword == k.name)).all())
+
         tag = session.get(Tag, k.tag_id) if k.tag_id else None
+        display_sub = (tag.label_ko if tag and tag.label_ko else k.name)
         result.append({
             "id": k.id,
-            "major_category": tag.major_category if tag else "미분류",
+            "major_category": (tag.major_category if tag and tag.major_category else "미분류"),
             "mid_category": (tag.mid_category or "-") if tag else "-",
-            "sub_category": k.name,
+            "sub_category": display_sub,
             "article_count": article_count,
             "interval_hours": k.interval_hours,
         })
 
-    result.sort(key=lambda x: (x["major_category"], x["mid_category"], x["sub_category"]))
+    # 2026-08-10: "미분류"를 맨 위로 - 편집이 필요한 항목을 바로 찾을 수 있게.
+    # (major_category != "미분류")가 False(0)/True(1)로 평가되어, 미분류가
+    # 항상 먼저 정렬된다.
+    # 2026-08-10: 문자열이 "미분류"든 "Uncategorized"든 상관없이, 대분류가
+    # 비어있거나 미분류를 뜻하는 값이면 항상 맨 위로 오도록 명시적으로 판정한다.
+    # (언더스코어 등으로 문자열 자체를 바꿔서 알파벳 순서에 맡기는 방식은 대문자
+    # 알파벳(A-Z)보다 언더스코어의 문자 코드가 더 커서 오히려 안 먹힐 수 있음)
+    _UNCATEGORIZED_VALUES = {"미분류", "uncategorized", "misc", ""}
+
+    def _is_uncategorized(major: str) -> bool:
+        return not major or major.strip().lower() in _UNCATEGORIZED_VALUES
+
+    result.sort(key=lambda x: (not _is_uncategorized(x["major_category"]), x["major_category"], x["mid_category"], x["sub_category"]))
     return {"genres": result}
+class GenreUpdateRequest(BaseModel):
+    major_category: str
+    mid_category: str
+    sub_category: str
+
+
+@app.patch("/genres/{keyword_id}")
+def update_genre(keyword_id: int, request: GenreUpdateRequest, session: Session = Depends(get_session)):
+    """
+    장르편집기 테이블에서 대분류/중분류/소분류를 직접 수정할 때 사용.
+
+    2026-08-10 버그 수정: "소분류는 그대로 두고 중분류만 고치는" 흔한 케이스에서,
+    get_or_create_tag()의 "이름은 같은데 중분류가 다르면 별개 태그로 분리"
+    로직이 "자기 자신을 수정하는 것"까지 새로운 충돌로 오인해서 엉뚱한 태그를
+    새로 만들어버리는 버그가 있었다. 지금 이 키워드에 이미 연결된 태그가 바로
+    그 태그 자신이면(=소분류 이름이 그대로), 충돌 검사를 거칠 필요 없이 그
+    자리에서 바로 갱신한다. 소분류(이름) 자체가 바뀔 때만 새 이름 기준으로
+    찾거나 만드는 기존 경로(get_or_create_tag)를 탄다.
+    """
+    keyword = session.get(Keyword, keyword_id)
+    if not keyword:
+        raise HTTPException(status_code=404, detail="해당 장르를 찾을 수 없습니다.")
+
+    major = request.major_category.strip()
+    mid = request.mid_category.strip()
+    sub = request.sub_category.strip()
+    if not major or not mid or not sub:
+        raise HTTPException(status_code=400, detail="대분류/중분류/소분류를 모두 입력해주세요.")
+
+    current_tag = session.get(Tag, keyword.tag_id) if keyword.tag_id else None
+    current_display_name = (current_tag.label_ko if current_tag and current_tag.label_ko else keyword.name)
+
+    if current_tag and sub == current_display_name:
+        # 소분류(이름)는 그대로, 대분류/중분류만 수정하는 경우 - 지금 태그를 그대로 갱신
+        if tagging._contains_hangul(major):
+            major = tagging._translate_to_english_tag_name(major)
+        if tagging._contains_hangul(mid):
+            mid = tagging._translate_to_english_tag_name(mid)
+        current_tag.major_category = major
+        current_tag.mid_category = mid
+        session.add(current_tag)
+        session.commit()
+        return {
+            "status": "success",
+            "message": f"'{major} > {mid} > {sub}'로 분류를 수정했습니다.",
+        }
+
+    # 소분류(이름) 자체가 바뀐 경우 - 새 이름 기준으로 태그를 찾거나 만든다.
+    tag = tagging.get_or_create_tag(session, name=sub, major_category=major, mid_category=mid)
+    new_display_name = tag.label_ko or tag.name
+
+    if tag.name != keyword.name:
+        clash = session.exec(
+            select(Keyword).where(Keyword.name == tag.name, Keyword.id != keyword.id)
+        ).first()
+        if clash:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{new_display_name}' 이름의 키워드가 이미 존재합니다."
+            )
+        keyword.name = tag.name
+
+    keyword.tag_id = tag.id
+    session.add(keyword)
+    session.commit()
+
+    return {
+        "status": "success",
+        "message": f"'{major} > {mid} > {sub}'로 분류를 수정했습니다.",
+    }
 
 class GenreSelectItem(BaseModel):
     major_category: str
@@ -1751,6 +2136,14 @@ def delete_article(article_id: int, session: Session = Depends(get_session)):
     if not article:
         raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없습니다.")
 
+    # 2026-08-10 버그 수정: Article만 지우고 ArticleTag(다중 태그 연결)를 안 지워서,
+    # 기사는 삭제됐는데 "이 기사가 이 태그다"라는 연결 정보만 유령처럼 남는 문제가
+    # 있었다. /stats/keywords는 이 유령 연결까지 세서 실제로는 0건인 항목이 "N건"
+    # 으로 표시되고, 클릭하면 "데이터 없음"이 뜨는 원인이었다.
+    tag_links = session.exec(select(ArticleTag).where(ArticleTag.article_id == article_id)).all()
+    for link in tag_links:
+        session.delete(link)
+
     session.delete(article)
     session.commit()
 
@@ -1891,28 +2284,57 @@ _KEYWORD_STATS_CACHE_TTL = 60.0
 
 @app.get("/stats/keywords")
 def get_keyword_stats(session: Session = Depends(get_session)):
+    """
+    2026-08-10 전면 개편: 소분류를 평면으로 나열하지 않고, 중분류로 1차 그룹핑해서
+    반환한다. 화면에서 중분류 버튼을 누르면 그 아래 소분류들이 펼쳐지는 2단계
+    UI용 구조. Article과 조인해서, 삭제된 기사에 남아있는 유령 ArticleTag
+    연결은 자동으로 집계에서 빠진다.
+    """
     now = time.monotonic()
     if _keyword_stats_cache["data"] is not None and (now - _keyword_stats_cache["computed_at"]) < _KEYWORD_STATS_CACHE_TTL:
         return _keyword_stats_cache["data"]
 
-    # 2026-08-09: Article.category(단일값) 대신 ArticleTag(다중값)로 집계.
     tag_counts = session.exec(
-        select(Tag.name, sql_func.count(ArticleTag.id))
+        select(Tag.id, Tag.name, Tag.label_ko, Tag.mid_category, sql_func.count(ArticleTag.id))
         .join(ArticleTag, ArticleTag.tag_id == Tag.id)
-        .group_by(Tag.name)
+        .join(Article, Article.id == ArticleTag.article_id)
+        .group_by(Tag.id)
     ).all()
-    filtered_stats = {name: cnt for name, cnt in tag_counts if name}
 
+    mid_groups: dict[str, dict] = {}
+    seen_labels: set[str] = set()
+
+    for tag_id, name, label_ko, mid_category, cnt in tag_counts:
+        if not name or not cnt:
+            continue
+        clean = label_ko or name
+        mid_key = mid_category or "미분류"
+        group = mid_groups.setdefault(
+            mid_key, {"mid_category": mid_key, "total_count": 0, "sub_categories": []}
+        )
+        group["sub_categories"].append({"label": clean, "tag_id": tag_id, "count": cnt})
+        group["total_count"] += cnt
+        seen_labels.add(clean)
+
+    # 태그 연결이 없는(레거시) Article.keyword 기반 데이터는 "미분류" 아래로
     registered_counts = session.exec(
         select(Article.keyword, sql_func.count(Article.id))
         .where(Article.keyword.is_not(None))
         .group_by(Article.keyword)
     ).all()
     for kw_name, cnt in registered_counts:
-        if kw_name:
-            filtered_stats[kw_name] = cnt
+        if kw_name and kw_name not in seen_labels:
+            group = mid_groups.setdefault(
+                "미분류", {"mid_category": "미분류", "total_count": 0, "sub_categories": []}
+            )
+            group["sub_categories"].append({"label": kw_name, "tag_id": None, "count": cnt})
+            group["total_count"] += cnt
 
-    result = {"keyword_stats": filtered_stats}
+    result_list = sorted(mid_groups.values(), key=lambda g: (g["mid_category"] == "미분류", g["mid_category"]))
+    for g in result_list:
+        g["sub_categories"].sort(key=lambda s: -s["count"])
+
+    result = {"mid_categories": result_list}
     _keyword_stats_cache["data"] = result
     _keyword_stats_cache["computed_at"] = now
     return result
@@ -1944,8 +2366,21 @@ def _serialize_article_preview(a: Article) -> dict:
 @app.get("/articles")
 def get_articles(
     keyword: str = Query(None),
+    tag_id: int | None = Query(None),
     session: Session = Depends(get_session)
 ):
+    # 2026-08-10: 키워드별 현황 버튼이 이제 태그 고유번호로 정확히 조회한다.
+    # 텍스트 이름 매칭(아래 기존 분기)보다 항상 우선한다.
+    if tag_id is not None:
+        query = (
+            select(Article)
+            .join(ArticleTag, ArticleTag.article_id == Article.id)
+            .where(ArticleTag.tag_id == tag_id)
+            .order_by(Article.id.desc())
+        )
+        articles = session.exec(query).all()
+        return {"articles": [_serialize_article_preview(a) for a in articles]}
+
     if not keyword:
         query = select(Article).order_by(Article.id.desc())
         articles = session.exec(query).all()

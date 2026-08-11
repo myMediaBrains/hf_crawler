@@ -48,6 +48,11 @@ def seed_manual_sources(target_sources: list[dict]):
     앱 최초 기동 시, 기존 TARGET_SOURCES 하드코딩 리스트를 Source 테이블로 옮긴다.
     이미 같은 url이 Source 테이블에 있으면 건너뛰므로, 재기동해도 중복 생성되지 않는다.
     main.py의 lifespan()에서 한 번 호출하면 된다.
+
+    2026-08-10: 대괄호 카테고리를 이제 대분류가 아니라 중분류로 배치하고,
+    그 값이 이미 다른 곳에서 중분류로 쓰이고 있으면 그 대분류를 물려받는다
+    (없으면 "미분류"). 그리고 장르편집기에서 바로 보이도록 Keyword도 같이
+    만들어서, 새로 추가되는 고정 소스도 자동으로 장르편집기에 반영되게 한다.
     """
     with Session(engine) as session:
         added = 0
@@ -61,13 +66,18 @@ def seed_manual_sources(target_sources: list[dict]):
             if name.startswith("[") and "]" in name:
                 category = name[1:name.index("]")]
 
-            # 2026-08-09: Source.category(문자열) 필드가 삭제되고 tag_id(FK)로
-            # 대체됐다. 이름 앞 "[대괄호]"로 파싱한 카테고리는 이제 Tag로 만들어
-            # 연결한다.
             tag_id = None
             if category:
-                tag = tagging.get_or_create_tag(session, name=category, major_category=category)
+                matched_major = session.exec(
+                    select(Tag.major_category).where(Tag.mid_category == category)
+                ).first()
+                major = matched_major if matched_major else "미분류"
+                tag = tagging.get_or_create_tag(session, name=category, major_category=major, mid_category=category)
                 tag_id = tag.id
+
+                if not session.exec(select(Keyword).where(Keyword.name == tag.name)).first():
+                    session.add(Keyword(name=tag.name, tag_id=tag.id, months_back=1, interval_hours=24.0))
+                    session.commit()
 
             session.add(Source(
                 name=name,
@@ -275,9 +285,18 @@ def _track_candidates(session: Session, keyword: Keyword, discovered: list[tuple
 
 def _promote_candidate(session: Session, keyword: Keyword, candidate: CandidateSource):
     """후보 출처를 Source 테이블에 고정 소스로 승격한다 (origin=auto_promoted)."""
+    # 2026-08-10: 이전엔 keyword.name 단독으로만 검색어를 만들어서, 소분류만
+    # 반영되고 중분류(정밀 타격)와 지역(language)이 전부 무시됐다.
+    # GoogleNewsSearchCollector가 이미 갖고 있는 동일 로직(_build_precise_search_text)을
+    # 재사용해서 collect_for_keyword()와 승격 시점 URL 생성이 항상 일치하게 한다.
+    collector = COLLECTOR_REGISTRY["google_news_search"]
+    search_text = keyword.search_query or collector._build_precise_search_text(keyword, session)
+    is_korean = (getattr(keyword, "language", "en") or "en") == "ko"
+    locale = collector.REGION_LOCALE["KR" if is_korean else "US"]
+
     query_url = (
-        f"https://news.google.com/rss/search?q={quote(keyword.name)}+site:{candidate.domain}"
-        f"&hl=en-US&gl=US&ceid=US:en"
+        f"https://news.google.com/rss/search?q={quote(search_text)}+site:{candidate.domain}"
+        f"&hl={locale['hl']}&gl={locale['gl']}&ceid={locale['ceid']}"
     )
 
     existing = session.exec(select(Source).where(Source.url == query_url)).first()
@@ -288,12 +307,10 @@ def _promote_candidate(session: Session, keyword: Keyword, candidate: CandidateS
         name=f"[{keyword.name}] {candidate.source_name}",
         url=query_url,
         tag_id=keyword.tag_id,
-        # 2026-08-09: category(문자열) 대신 keyword.tag_id를 그대로 물려받는다 -
-        # 원본 키워드가 이미 Tag에 연결돼 있으므로 재계산할 필요가 없다.
         source_type="google_news_search",
         origin=SourceOrigin.AUTO_PROMOTED,
         interval_hours=keyword.interval_hours,
         keyword_id=keyword.id,
     ))
     session.commit()
-    logger.info(f"[scheduler] 승격: {candidate.source_name} ({candidate.domain}) -> Source 등록 완료")
+    logger.info(f"[scheduler] 승격: {candidate.source_name} ({candidate.domain}) -> Source 등록 완료 (검색어: '{search_text}')")

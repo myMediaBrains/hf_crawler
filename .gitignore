@@ -14,3 +14,10 @@ hf-frontend/dist/
 
 # OS
 .DS_Store*.db.backup
+data/
+local_deep_trend.db
+local_deep_trend.db-shm
+local_deep_trend.db-wal
+venv/
+hf-frontend/node_modules/
+__pycache__/

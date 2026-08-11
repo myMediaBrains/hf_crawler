@@ -285,13 +285,51 @@ def _looks_like_consent_boilerplate(text: str) -> bool:
     # 4000자 이상의 충분히 긴 글이면 힌트가 몇 개 섞여 있어도 대부분 실제 본문일 가능성이 높음.
     return hits >= 3 and len(text.strip()) < 4000
 
+# 페이월/구독 유도 문구 힌트. 실제 기사 안에서 "subscribe"란 단어가 한두 번
+# 스치는 정상적인 경우를 오탐하지 않도록, consent 배너와 동일한 원칙(여러 개가
+# 함께 나와야만 판정)을 적용한다. TradingView/Reuters 신디케이션처럼 본문 대신
+# "Get unlimited access to articles from..." 한 줄만 반환하는 사이트에서 발견됨
+# (2026-08-10).
+_PAYWALL_BOILERPLATE_HINTS = [
+    r'unlimited access to articles',
+    r'subscribe to (?:continue|read)',
+    r'sign in to (?:continue|read)',
+    r'start your free trial',
+    r'become a (?:member|subscriber)',
+    r'subscription required',
+    r'this content is (?:for|reserved for) subscribers',
+    r'to continue reading',
+    r'create a free account',
+    r'already a subscriber\??',
+]
+
+
+def _looks_like_paywall_boilerplate(text: str) -> bool:
+    """
+    크롤링된 텍스트가 실제 기사 본문이 아니라 페이월/구독 유도 안내문인지 판별한다.
+    _looks_like_consent_boilerplate()와 동일한 원칙: 힌트가 2개 이상 겹치고,
+    전체 길이가 짧을 때만(진짜 기사 본문 안에 우연히 한 문구가 섞인 경우를 오탐하지
+    않기 위해) 페이월로 판정한다. 동의배너보다 훨씬 짧게(보통 한두 문장) 나오는
+    경우가 많아 임계값을 낮게(1000자) 잡았다.
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    hits = sum(1 for pattern in _PAYWALL_BOILERPLATE_HINTS if re.search(pattern, lower))
+    return hits >= 2 and len(text.strip()) < 1000
+
 
 def _select_crawled_markdown(fit: str | None, raw: str | None) -> str:
     """
-    fit_markdown(밀도 필터링본)을 우선 쓰되, 쿠키 동의 배너로 판별되면 raw_markdown으로
-    한 번 더 시도한다. 둘 다 동의 배너로 보이면 실패로 처리해서(플레이스홀더 반환)
-    DB에 쌓이지 않도록 한다 (is_crawl_failure()가 걸러줌).
+    fit_markdown(밀도 필터링본)을 우선 쓰되, 쿠키 동의 배너나 페이월 안내문으로
+    판별되면 raw_markdown으로 한 번 더 시도한다. 둘 다 그렇게 보이면 실패로
+    처리해서(플레이스홀더 반환) DB에 쌓이지 않도록 한다 (is_crawl_failure()가
+    걸러줌). 2026-08-10: 페이월 판별 추가 (TradingView/Reuters 신디케이션 등에서
+    "Get unlimited access..." 같은 안내문이 본문으로 저장되던 문제 방지).
     """
+    def _is_boilerplate(text: str) -> bool:
+        return _looks_like_consent_boilerplate(text) or _looks_like_paywall_boilerplate(text)
+
     candidates = []
     if fit and len(fit.strip()) >= 200:
         candidates.append(fit)
@@ -299,13 +337,15 @@ def _select_crawled_markdown(fit: str | None, raw: str | None) -> str:
         candidates.append(raw)
 
     for candidate in candidates:
-        if not _looks_like_consent_boilerplate(candidate):
+        if not _is_boilerplate(candidate):
             return candidate
 
     if candidates:
+        last = candidates[-1]
+        if _looks_like_paywall_boilerplate(last):
+            return "크롤링 결과가 페이월/구독 안내문으로 판별됨 (본문 추출 실패)"
         return "크롤링 결과가 쿠키/개인정보 동의 배너로 판별됨 (본문 추출 실패)"
     return raw or "Crawl4AI 본문 추출 실패"
-
 
 def is_crawl_failure(text: str) -> bool:
     """
@@ -372,6 +412,8 @@ def classify_block_reason(raw_content: str) -> str:
     text = raw_content.strip()
     if "타임아웃" in text:
         return "타임아웃"
+    if "페이월" in text or "구독 안내문" in text:
+        return "페이월차단"
     if "동의 배너" in text or "쿠키" in text:
         return "동의배너차단"
     if "크롤링 중 에러" in text:

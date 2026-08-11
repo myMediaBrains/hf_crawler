@@ -1,0 +1,6 @@
+venv/
+hf-frontend/node_modules/
+__pycache__/
+*.db
+.git/
+EOF

@@ -24,7 +24,7 @@ import requests
 import feedparser
 from sqlmodel import Session, select
 
-from models import Article, Source, Keyword, ContentOrigin, SourceOrigin, SourceStatus, BlockedDomain
+from models import Article, Source, Keyword, Tag, ContentOrigin, SourceOrigin, SourceStatus, BlockedDomain
 from content_utils import clean_article_content, crawl_url_sync, is_crawl_failure, classify_block_reason
 from personalization import classify_and_store
 import tagging
@@ -133,16 +133,34 @@ class GoogleNewsSearchCollector(BaseCollector):
     """
 
     def collect(self, source: Source, session: Session) -> CollectResult:
+        # 2026-08-09 수정: source.category는 삭제된 필드다(AttributeError 발생 중이던
+        # 버그). 승격된 소스는 keyword_id로 원본 키워드와 연결돼 있으므로, 거기서
+        # 이름을 가져온다.
+        keyword_name = None
+        require_korean_content = False
+        if source.keyword_id:
+            kw = session.get(Keyword, source.keyword_id)
+            if kw:
+                keyword_name = kw.name
+                require_korean_content = (getattr(kw, "language", "en") or "en") == "ko"
+
         return self._fetch_and_save(
             query_url=source.url,
             fixed_source_name=source.name,
-            keyword_name=source.category,
+            keyword_name=keyword_name,
             session=session,
             track_domains=False,
+            require_korean_content=require_korean_content,
         )
 
     def collect_for_keyword(self, keyword: Keyword, session: Session, max_entries: int = 20) -> CollectResult:
-        query_url = self._build_keyword_search_url(keyword.name, keyword.months_back)
+        # 2026-08-09 수정: search_query/language(지역)가 반영 안 되고 예전 단순
+        # 버전으로 되돌아가 있던 버그. search_query가 있으면(자유 검색 문구) 그걸
+        # 쓰고, keyword.language="ko"면 한국 지역으로 검색한다.
+        search_text = keyword.search_query or self._build_precise_search_text(keyword, session)
+        is_korean = (getattr(keyword, "language", "en") or "en") == "ko"
+        region = "KR" if is_korean else "US"
+        query_url = self._build_keyword_search_url(search_text, keyword.months_back, region=region)
         return self._fetch_and_save(
             query_url=query_url,
             fixed_source_name=None,
@@ -150,7 +168,31 @@ class GoogleNewsSearchCollector(BaseCollector):
             session=session,
             track_domains=True,
             max_entries=max_entries,
+            require_korean_content=is_korean,
         )
+
+    @staticmethod
+    def _build_precise_search_text(keyword: Keyword, session: Session) -> str:
+        """
+        search_query가 명시적으로 없을 때, 소분류 단독보다 더 정밀한 검색어를
+        만든다. 예: 소분류 "Samsung Electronics" + 중분류 "Semiconductor" ->
+        "Samsung Electronics Semiconductor"로 검색해서 "삼성전자의 반도체 관련
+        뉴스"만 정밀 타격한다 (2026-08-10).
+
+        2026-08-10 추가 수정: 소분류가 중분류 충돌로 내부적으로 구분된 태그
+        (Tag.name="Chips (Food)")에 연결돼 있어도, 검색어 조합엔 사람이 실제로
+        입력한 깨끗한 텍스트(Tag.label_ko="Chips")를 써야 한다 - 안 그러면
+        "Chips (Food) Food"처럼 어색한 검색어가 만들어진다.
+        """
+        if not keyword.tag_id:
+            return keyword.name
+        tag = session.get(Tag, keyword.tag_id)
+        if not tag:
+            return keyword.name
+        display_name = tag.label_ko or keyword.name
+        if tag.mid_category and tag.mid_category.strip() and tag.mid_category != display_name:
+            return f"{display_name} {tag.mid_category}"
+        return display_name
 
     def _fetch_and_save(
         self,
@@ -160,6 +202,7 @@ class GoogleNewsSearchCollector(BaseCollector):
         session: Session,
         track_domains: bool,
         max_entries: int = 20,
+        require_korean_content: bool = False,
     ) -> CollectResult:
         new_count = 0
         discovered: list[tuple[str, str]] = []
@@ -223,6 +266,15 @@ class GoogleNewsSearchCollector(BaseCollector):
                 continue
 
             cleaned = clean_article_content(raw_content)
+
+            # 2026-08-10: region="KR"(한국어 검색)로 찾은 결과라도, Google 뉴스는
+            # hl/gl과 무관하게 영어 기사(로이터 등 통신사 기사, 연합뉴스 영문판 등)를
+            # 섞어서 보여줄 수 있다. "한글로 검색하면 한글 자료로 표시"라는 요구를
+            # 지키려면, 실제 크롤링된 본문이 한글인지 우리 쪽에서 한 번 더 확인해야
+            # 한다 - 한글이 전혀 없으면 저장하지 않고 건너뛴다.
+            if require_korean_content and not tagging._contains_hangul(title + cleaned):
+                logger.info(f"[GoogleNewsSearchCollector] 한국어 검색인데 본문이 영어라 건너뜀: {resolved_link}")
+                continue
 
             article = Article(
                 title=title,

@@ -12,12 +12,12 @@ import { useState } from "react";
 import axios from "axios";
 import SourceManager from "./SourceManager";
 import SourceEvaluation from "./SourceEvaluation";
+import GitHubRepos from "./GitHubRepos";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 export default function GenreEditor() {
-  // 2026-08-10: 출처관리/출처평가를 메인 화면에서 빼서 이 안에 탭으로 통합
-  const [activeTab, setActiveTab] = useState("genres"); // "genres" | "sources" | "evaluation"
+  const [activeTab, setActiveTab] = useState("genres"); // "genres" | "sources" | "evaluation" | "github"
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -152,12 +152,20 @@ export default function GenreEditor() {
               >
                 📊 출처 평가
               </button>
+              <button
+                className={`genre-editor-tab ${activeTab === "github" ? "active" : ""}`}
+                onClick={() => setActiveTab("github")}
+              >
+                🐙 GitHub 저장소
+              </button>
             </div>
 
             {activeTab === "sources" ? (
-              <SourceManager />
+              <div className="genre-editor-table-wrap"><SourceManager /></div>
             ) : activeTab === "evaluation" ? (
-              <SourceEvaluation embedded />
+              <div className="genre-editor-table-wrap"><SourceEvaluation embedded /></div>
+            ) : activeTab === "github" ? (
+              <div className="genre-editor-table-wrap"><GitHubRepos /></div>
             ) : (
               <>
 

@@ -1520,11 +1520,12 @@ body {
 
 /* ── 소스 테이블 스크롤 컨테이너 ── */
 .source-table-scroll {
-    min-height: 900px;   /* 소스가 적어도 항상 8행 이상 볼 수 있는 높이는 확보 */
-    max-height: 1100px;   /* 소스가 많을 때 스크롤 전까지 보이는 최대 높이 */
+    min-height: 900px;
+    max-height: 1100px;
     overflow-y: auto;
     border: 1px solid #334155;
     border-radius: 6px;
+    overscroll-behavior: contain;
 }
 
 /* 컬럼 헤더(소스/구분/URL/주기)는 스크롤해도 항상 맨 위에 고정 */
@@ -2131,6 +2132,7 @@ body {
   overflow-y: auto;
   flex: 1;
   min-height: 0;
+  overscroll-behavior: contain;
 }
 
 .source-eval-table {
@@ -2265,6 +2267,11 @@ body {
   overflow-y: auto;
   flex: 1;
   min-height: 0;
+  max-height: calc(86vh - 160px); /* 2026-08-10: flex 계산이 부모(.genre-editor-panel)의
+                                      가변 높이에 좌우돼 스크롤이 아예 안 걸리던 문제 -
+                                      부모 크기와 무관하게 직접 상한을 줘서 확실히 넘치게 함
+                                      (헤더+탭+패딩 대략치를 뺀 값) */
+ overscroll-behavior: contain;
 }
 
 .genre-editor-table {
@@ -2389,4 +2396,73 @@ body {
 .stat-badge-btn-sub {
     font-size: 0.8rem;
     opacity: 0.92;
+}
+.github-repo-card {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.github-repo-name {
+    font-weight: 600;
+    color: #60a5fa;
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+.github-repo-name:hover {
+    text-decoration: underline;
+}
+
+.github-repo-stars {
+    font-size: 0.85rem;
+    color: #fbbf24;
+    white-space: nowrap;
+}
+
+.github-repo-lang {
+    font-size: 0.75rem;
+    background: #334155;
+    color: #94a3b8;
+    padding: 2px 8px;
+    border-radius: 4px;
+}
+
+.github-repo-growth {
+    font-size: 0.75rem;
+    color: #22c55e;
+}
+
+.github-repo-summary {
+    font-size: 0.82rem;
+    color: #cbd5e1;
+    margin-top: 8px;
+    line-height: 1.4;
+}
+.github-detail-section {
+    margin-bottom: 16px;
+}
+.github-detail-section h4 {
+    margin: 0 0 4px 0;
+    font-size: 0.85rem;
+    color: #94a3b8;
+}
+.github-detail-section p {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    color: #e2e8f0;
+}
+.github-readme-raw {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 16px;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    max-height: 60vh;
+    overflow-y: auto;
 }

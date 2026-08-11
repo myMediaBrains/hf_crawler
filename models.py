@@ -478,3 +478,70 @@ class TextGeneration(SQLModel, table=True):
         default_factory=datetime.utcnow,
         sa_column=Column(DateTime, server_default=func.now())
     )
+
+# ============================================================
+# GitHub 오픈소스 저장소 (신규, 2026-08-10)
+# ============================================================
+
+class GitHubRepo(SQLModel, table=True):
+    """GitHub 레포 최신 상태 1건당 1행. 스타 수 등 시계열은 GitHubRepoSnapshot에 별도 보관."""
+    __tablename__ = "github_repos"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    full_name: str = Field(unique=True, index=True)  # "owner/repo"
+    url: str
+    description: Optional[str] = None
+    primary_language: Optional[str] = None
+    readme_content: Optional[str] = None
+    readme_hash: Optional[str] = None
+    summary: Optional[str] = None
+    created_at_github: Optional[str] = None  # 게재 시점
+    pushed_at_github: Optional[str] = None   # 2026-08-10: 마지막 업데이트 시점 (신규)
+    last_checked_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # 2026-08-10: 3단계 화면(테이블/상세/README) 지원용 - LLM 분석 결과.
+    # 지연 생성(첫 상세 조회 시)하고, analysis_hash가 readme_hash와 다를 때만 재생성.
+    field_short: Optional[str] = None          # 분야 (짧은 단어)
+    application_short: Optional[str] = None    # 응용분야 (짧은 단어)
+    relevance_short: Optional[str] = None      # 연관성 (짧은 단어)
+    components_short: Optional[str] = None     # 구성요소 (짧은 단어)
+    detailed_overview: Optional[str] = None
+    detailed_application: Optional[str] = None
+    detailed_relations: Optional[str] = None
+    future_direction: Optional[str] = None
+    analysis_hash: Optional[str] = None        # 이 분석이 만들어진 시점의 readme_hash
+
+
+class GitHubRepoSnapshot(SQLModel, table=True):
+    """스타/포크 시계열 스냅샷 (append-only) - 절대 덮어쓰지 않음."""
+    __tablename__ = "github_repo_snapshots"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    repo_id: int = Field(foreign_key="github_repos.id", index=True)
+    stars: int = 0
+    forks: int = 0
+    open_issues: int = 0
+    snapshot_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class GitHubReadmeHistory(SQLModel, table=True):
+    """README 변경 이력 (append-only) - 해시가 바뀔 때만 새 행 추가."""
+    __tablename__ = "github_readme_history"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    repo_id: int = Field(foreign_key="github_repos.id", index=True)
+    content: str
+    content_hash: str
+    summary: Optional[str] = None
+    recorded_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class GitHubRepoTag(SQLModel, table=True):
+    """ArticleTag와 동일 패턴 - 뉴스와 같은 Tag 체계를 공유한다."""
+    __tablename__ = "github_repo_tags"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    repo_id: int = Field(foreign_key="github_repos.id", index=True)
+    tag_id: int = Field(foreign_key="tags.id", index=True)
+    score: float = Field(default=1.0)
