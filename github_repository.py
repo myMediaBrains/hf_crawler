@@ -24,6 +24,7 @@ from datetime import datetime
 
 from sqlmodel import Session, select
 
+import job_control
 from models import GitHubRepo, GitHubRepoSnapshot, GitHubReadmeHistory, GitHubRepoTag
 import tagging
 import model_router
@@ -170,14 +171,28 @@ def collect_repo(session: Session, repo_json: dict) -> GitHubRepo:
 
 
 def discover_and_collect(session: Session, query: str, max_entries: int = 10) -> int:
-    """검색 -> 결과 전부 collect_repo(). 반환: 처리한 레포 수."""
+    """
+    검색 -> 결과 전부 collect_repo() + 즉시 상세분석 생성. 반환: 처리한 레포 수.
+    취소 신호 오면 중간에 멈춘다.
+
+    2026-08-12: 예전엔 상세 분석(분야/응용분야/연관성/구성요소)이 사용자가
+    상세보기를 클릭할 때만 지연 생성돼서, 표(1단계)에는 아직 분석 안 된
+    레포가 "-"로 비어 보였다. 분야/응용분야/연관성은 표에서 반드시 채워져
+    있어야 하므로, 수집 직후 바로 분석까지 끝내둔다.
+    """
     items = search_repositories(query, max_entries=max_entries)
+    processed = 0
     for item in items:
+        if job_control.is_cancelled():
+            logger.info("[github_repository] 사용자 요청으로 크롤링 중단")
+            break
         try:
-            collect_repo(session, item)
+            repo = collect_repo(session, item)
+            get_or_generate_detail(session, repo.id)
+            processed += 1
         except Exception as e:
             logger.error(f"[github_repository] 수집 실패 ({item.get('full_name')}): {e}")
-    return len(items)
+    return processed
 
 _DETAIL_MARKERS = {
     "분야": "field_short",
@@ -246,17 +261,19 @@ def _generate_detail_analysis(repo: GitHubRepo) -> dict:
         f"README:\n{(repo.readme_content or '')[:6000]}\n\n"
         "아래 형식 그대로, 각 항목을 채워줘. 대괄호 표시([...])는 그대로 유지하고 "
         "그 뒤에 내용만 써:\n\n"
-        f"[분야]: (한 단어, 예: AI/웹개발/데이터베이스)\n"
-        f"[응용분야]: (다음 목록 중에서만 골라 쉼표로 나열, 해당 없으면 \"해당없음\": "
+        f"[분야]: (반드시 채울 것, 절대 비워두지 말 것 - 한 단어, 예: AI/웹개발/데이터베이스)\n"
+        f"[응용분야]: (다음 목록 중에서 반드시 1개 이상 골라 쉼표로 나열 - "
+        f"\"해당없음\"은 쓰지 말고, 가장 근접한 것을 반드시 골라야 함: "
         f"{', '.join(APPLICATION_FIELDS)})\n"
-        "[연관성]: (이 오픈소스가 위 \"내 플랫폼\"과 얼마나 관련 있는지, 다음 중 "
-        "하나만: 매우높음, 높음, 보통, 낮음, 매우낮음)\n"
-        f"[구성요소]: (연관성이 \"보통\" 이상일 때만, 다음 목록 중 관련된 내 플랫폼 "
-        f"구성요소를 쉼표로 나열, 아니면 \"해당없음\": {', '.join(MY_PLATFORM_COMPONENTS)})\n"
+        "[연관성]: (이 오픈소스가 위 \"내 플랫폼\"과 얼마나 관련 있는지, 다음 세 "
+        "글자 중 하나만 정확히 그대로 써 - H(높음), M(보통), L(낮음))\n"
+        f"[구성요소]: (연관성이 L이 아닐 때만(H 또는 M이면) 다음 목록 중 관련된 "
+        f"내 플랫폼 구성요소를 쉼표로 나열, 연관성이 L이면 반드시 공란으로 비워둘 것: "
+        f"{', '.join(MY_PLATFORM_COMPONENTS)})\n"
         "[상세개요]\n(이 프로젝트가 무엇을 하는지 3~5문장으로 자세히)\n\n"
         "[상세응용분야]\n(위에서 고른 응용분야에 왜 해당하는지, 실제 사용 상황 3~4문장)\n\n"
         "[구성요소연관성]\n(내 플랫폼의 어느 구성요소와 왜/어떻게 연결될 수 있는지 "
-        "구체적으로 3~4문장. 연관성이 낮음/매우낮음이면 \"내 플랫폼과 직접적인 "
+        "구체적으로 3~4문장. 연관성이 L이면 \"내 플랫폼과 직접적인 "
         "관련성은 낮음\"이라고만 써)\n\n"
         "[향후방향]\n(README의 로드맵/이슈 등을 참고해 향후 발전 방향을 추론, 2~3문장)\n"
     )
@@ -272,12 +289,33 @@ def get_or_generate_detail(session: Session, repo_id: int) -> GitHubRepo | None:
     """
     2단계(상세) 조회 시 호출. 분석이 없거나 README가 바뀐 뒤 재분석이 안 됐으면
     그 자리에서 생성하고 캐시한다.
+
+    2026-08-12 강화: README/개요가 그대로여도, 분야/응용분야/연관성이 비어
+    있거나(또는 연관성이 H/M/L 형식이 아니거나) 연관성이 H·M인데 구성요소가
+    비어있으면(=채워야 하는데 안 채워진 경우) "적합한 답이 아니다"로 보고
+    LLM 재생성을 다시 돌린다. 연관성이 L일 때 구성요소가 비어있는 건 정상
+    (일부러 공란으로 두는 규칙)이라 그 경우는 재생성 사유로 안 삼는다.
     """
     repo = session.get(GitHubRepo, repo_id)
     if repo is None:
         return None
 
-    needs_generation = (repo.analysis_hash != repo.readme_hash) or not repo.detailed_overview
+    components_missing_when_required = (
+        repo.relevance_short in ("H", "M") and not repo.components_short
+    )
+    core_fields_inadequate = (
+        not repo.field_short
+        or not repo.application_short
+        or repo.relevance_short not in ("H", "M", "L")
+        or components_missing_when_required
+    )
+
+    needs_generation = (
+        (repo.analysis_hash != repo.readme_hash)
+        or not repo.detailed_overview
+        or core_fields_inadequate
+    )
+
     if needs_generation and repo.readme_content:
         sections = _generate_detail_analysis(repo)
         if sections:
@@ -288,4 +326,23 @@ def get_or_generate_detail(session: Session, repo_id: int) -> GitHubRepo | None:
             session.add(repo)
             session.commit()
             session.refresh(repo)
+
+    # 그래도 남아있으면(예: README 자체가 없어서 LLM 분석을 아예 못 돌린
+    # 경우) 최후의 안전장치로 최소 기본값을 채운다. 분야/응용분야/연관성은
+    # 표에서 절대 비어 보이면 안 되는 필수 항목이다.
+    changed = False
+    if not repo.field_short:
+        repo.field_short = repo.primary_language or "기타"
+        changed = True
+    if not repo.application_short:
+        repo.application_short = "기타"
+        changed = True
+    if repo.relevance_short not in ("H", "M", "L"):
+        repo.relevance_short = "M"
+        changed = True
+    if changed:
+        session.add(repo)
+        session.commit()
+        session.refresh(repo)
+
     return repo

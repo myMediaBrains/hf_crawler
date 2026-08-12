@@ -174,7 +174,12 @@ def get_profile(
         contribution = row.confidence * row.weight * decay
         entry = profile.setdefault(
             tag.name,
-            {"score": 0.0, "n_signals": 0, "major_category": row.major_category,
+            {"score": 0.0, "n_signals": 0, "major_category": tag.major_category,
+             # 2026-08-12: row.major_category(신호 생성 시점 스냅샷) 대신
+             # tag.major_category(현재값)를 쓴다 - InteractionSignal은
+             # append-only라 과거 신호를 고칠 수 없지만, 관리자가 나중에
+             # Tag.major_category를 재분류하면 이 조회가 항상 최신 분류를
+             # 반영하도록 하기 위함 (과거 신호를 UPDATE하지 않고도 정확해짐).
              "sensitive": tag.sensitive},
         )
         entry["score"] += contribution

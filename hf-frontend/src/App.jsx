@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import { toast, Toaster } from 'react-hot-toast';
 import ArticleCard from './ArticleCard';
 import GenreEditor from "./GenreEditor";
+import PersonalRepository from "./PersonalRepository";
 import GitHubRepos from "./GitHubRepos";
 import GenrePreferenceSelector from "./GenrePreferenceSelector";
 import CrawlToggleButton from "./CrawlToggleButton";
@@ -92,6 +93,22 @@ function App() {
     const [message, setMessage] = useState('');
     const [keywordStats, setKeywordStats] = useState([]); // 이제 중분류 그룹 배열: [{mid_category, total_count, sub_categories}]
     const [expandedMidCategory, setExpandedMidCategory] = useState(null);
+    // 2026-08-12: UserRegister.jsx가 가입/로그인/로그아웃마다 쏘는
+    // 'hf-user-registered' 이벤트를 받아서 현재 로그인 사용자를 추적한다.
+    // 관리자 버튼("Admin"으로 로그인했을 때만 노출) 조건 판단에 쓴다.
+    const [currentUserId, setCurrentUserId] = useState(() => localStorage.getItem('hf_user_id'));
+    useEffect(() => {
+        const handler = (e) => setCurrentUserId(e.detail?.user_id || null);
+        window.addEventListener('hf-user-registered', handler);
+        return () => window.removeEventListener('hf-user-registered', handler);
+    }, []);
+
+    // 2026-08-12: 선호 장르를 하나도 선택 안 한 사용자에게는 메인화면 기사
+    // 목록을 숨기고 안내만 보여준다. null=아직 확인 전(이때도 숨김 - "확인
+    // 전엔 일단 보여주자"로 했다가 새 사용자에게 잠깐이라도 전체 공개되는
+    // 버그가 있었음, 2026-08-12 수정: 기본값을 '숨김' 쪽으로 안전하게 변경).
+    // 실제 확인/재조회 로직은 fetchArticles 정의 이후로 내려가 있음(TDZ 문제 방지).
+    const [hasPreferences, setHasPreferences] = useState(null);
 
     // '검색주기설정' 옆 상시 노출 입력창 2개 - 현시점 기준 최근 몇 개월 자료를 가져올지,
     // 몇 시간마다 백그라운드로 재수집할지. 예전엔 ⚙ 토글 버튼을 눌러야 나오는
@@ -175,11 +192,12 @@ function App() {
     // ============================================
     const fetchArticles = useCallback(async (targetKeyword = '', tagId = null) => {
         try {
+            const storedUserId = localStorage.getItem('hf_user_id') || '';
             const url = tagId
                 ? `${API_URL}/articles?tag_id=${encodeURIComponent(tagId)}`
                 : targetKeyword.trim()
                     ? `${API_URL}/articles?keyword=${encodeURIComponent(targetKeyword.trim())}`
-                    : `${API_URL}/articles`;
+                    : `${API_URL}/articles?user_id=${encodeURIComponent(storedUserId)}`;
             
             const response = await axios.get(url);
             const fetched = response.data.articles || [];
@@ -201,6 +219,24 @@ function App() {
             toast.error('아티클을 불러오는데 실패했습니다.');
         }
     }, [API_URL]);
+
+    // 2026-08-12: 로그인/가입/로그아웃으로 currentUserId가 바뀔 때마다
+    // (a) 이 사용자의 선호 장르 보유 여부를 다시 확인하고
+    // (b) 메인화면 기사 목록도 그 사용자 기준으로 다시 불러온다.
+    // fetchArticles가 이 시점엔 이미 정의돼 있어야 해서 여기(정의 바로 다음)로 옮김.
+    useEffect(() => {
+        if (!currentUserId) {
+            setHasPreferences(true); // 미로그인 상태는 게이트 대상 아님(전체 공개 유지)
+            fetchArticles();
+            return;
+        }
+        setHasPreferences(null); // 사용자가 바뀌는 순간 일단 숨김 상태로(이전 사용자 화면이 새 사용자에게 안 새어나가게)
+        axios.get(`${API_URL}/personalization/has-preferences`, { params: { user_id: currentUserId } })
+            .then((res) => setHasPreferences(!!res.data.has_preferences))
+            .catch(() => setHasPreferences(false)); // 조회 실패 시에도 안전하게 숨기는 쪽으로
+        fetchArticles();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentUserId]);
 
     // 목록에는 미리보기 본문만 있으므로, 펼치기/편집 시 전체 본문을 따로 불러와
     // articles 상태의 해당 항목만 갱신한다. 반환값을 직접 써야 하는 호출부(편집
@@ -263,8 +299,12 @@ function App() {
 
 
     const fetchVaultFolders = useCallback(async () => {
+        const storedUserId = localStorage.getItem('hf_user_id');
+        if (!storedUserId) return; // 로그인 전에는 조회 자체를 안 함
         try {
-            const response = await axios.get(`${API_URL}/vault/folders`);
+            const response = await axios.get(`${API_URL}/vault/folders`, {
+                params: { user_id: storedUserId },
+            });
             setVaultFolders(response.data.folders || []);
         } catch (err) {
             console.error("볼트 폴더 조회 에러:", err);
@@ -352,8 +392,9 @@ function App() {
         );
 
         try {
+            const storedUserId = localStorage.getItem('hf_user_id') || '';
             const url = targetKeyword
-                ? `${API_URL}/collect/deep-incremental?keyword=${encodeURIComponent(targetKeyword)}&months_back=${monthsBack}&interval_hours=${intervalHours}`
+                ? `${API_URL}/collect/deep-incremental?keyword=${encodeURIComponent(targetKeyword)}&months_back=${monthsBack}&interval_hours=${intervalHours}&user_id=${encodeURIComponent(storedUserId)}`
                 : `${API_URL}/collect/deep-incremental`;
 
             const response = await axios.get(url, { signal: controller.signal });
@@ -707,14 +748,22 @@ function App() {
         setLoading(false);
     };
 
-    const handleExportToVault = async (articleId, folder, filename, content) => {
-        const toastId = toast.loading('개인저장방에 저장 중...');
+    const handleExportToVault = async (articleId, folder, filename, content, sourceTitle, sourceRef) => {
+        const storedUserId = localStorage.getItem('hf_user_id');
+        if (!storedUserId) {
+            toast.error('사용자 등록/로그인 후 이용할 수 있습니다.');
+            return;
+        }
+        const toastId = toast.loading('저장소에 저장 중...');
         try {
-            const response = await axios.post(`${API_URL}/vault/export`, { folder, filename, content });
+            const response = await axios.post(`${API_URL}/vault/export`, {
+                folder, filename, content, user_id: storedUserId,
+                source_title: sourceTitle, source_ref: sourceRef,
+            });
             toast.success(`저장 완료: ${response.data.filename}`, { id: toastId });
             await fetchVaultFolders();
         } catch (err) {
-            console.error("볼트 저장 에러:", err);
+            console.error("저장소 저장 에러:", err);
             toast.error('저장 실패', { id: toastId });
         }
     };
@@ -979,7 +1028,11 @@ function App() {
                     이동했고, 이 자리엔 데이터편집 탭에서 빠져나온 GitHub 저장소가 들어왔다. */}
                 <GitHubRepos />
 
-                <GenreEditor />
+                {/* 2026-08-12: 데이터편집은 Admin으로 로그인했을 때만 노출.
+                    관리자(미분류 키워드 처리) 탭도 이 안으로 옮겨졌다. */}
+                {currentUserId === 'Admin' && <GenreEditor />}
+
+                <PersonalRepository />
             </div>
 
             {message && (
@@ -1095,7 +1148,12 @@ function App() {
             </div>
 
             <div className="article-list">
-                {articles.length === 0 ? (
+                {currentUserId && !hasPreferences ? (
+                    <div className="no-data preference-prompt">
+                        <p>⭐ 아직 선호 장르를 선택하지 않으셨네요.</p>
+                        <p>상단의 <strong>"⭐ 선호 장르 선택"</strong> 버튼에서 관심 있는 장르를 골라 저장하면, 그에 맞는 자료가 여기 나타납니다.</p>
+                    </div>
+                ) : articles.length === 0 ? (
                     <p className="no-data">📭 조건에 일치하는 데이터가 없습니다.</p>
                 ) : (
                     articles.map((article) => (

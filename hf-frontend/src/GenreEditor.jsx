@@ -21,11 +21,12 @@ import axios from "axios";
 import SourceManager from "./SourceManager";
 import SourceEvaluation from "./SourceEvaluation";
 import IntervalSettings from "./IntervalSettings";
+import AdminPanel from "./AdminPanel";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 export default function GenreEditor() {
-  const [activeTab, setActiveTab] = useState("genres"); // "genres" | "sources" | "evaluation" | "interval"
+  const [activeTab, setActiveTab] = useState("genres"); // "genres" | "sources" | "evaluation" | "interval" | "admin"
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -166,6 +167,12 @@ export default function GenreEditor() {
               >
                 ⏱️ 검색주기설정
               </button>
+              <button
+                className={`genre-editor-tab ${activeTab === "admin" ? "active" : ""}`}
+                onClick={() => setActiveTab("admin")}
+              >
+                🛠 관리자
+              </button>
             </div>
 
             {activeTab === "sources" ? (
@@ -174,6 +181,8 @@ export default function GenreEditor() {
               <SourceEvaluation embedded />
             ) : activeTab === "interval" ? (
               <IntervalSettings onSaved={() => setActiveTab("genres")} />
+            ) : activeTab === "admin" ? (
+              <AdminPanel />
             ) : (
               <>
 

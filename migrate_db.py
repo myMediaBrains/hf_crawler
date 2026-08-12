@@ -208,6 +208,7 @@ GITHUB_REPOS_MIGRATIONS = [
     ("detailed_relations", "ALTER TABLE github_repos ADD COLUMN detailed_relations TEXT"),
     ("future_direction", "ALTER TABLE github_repos ADD COLUMN future_direction TEXT"),
     ("analysis_hash", "ALTER TABLE github_repos ADD COLUMN analysis_hash TEXT"),
+    ("extra_notes", "ALTER TABLE github_repos ADD COLUMN extra_notes TEXT"),
 ]
 
 

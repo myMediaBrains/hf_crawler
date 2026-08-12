@@ -1,7 +1,10 @@
 import { useRef, useEffect, useState } from 'react';
+import axios from 'axios';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import MarkdownEditor from './MarkdownEditor';
+import useCurrentUser from './useCurrentUser';
+
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 
 // 2026-08-09: 번역 버튼 양방향화 - wantKorean=true면 한글 줄만(기존 동작,
 // 영→한 기사의 "한글보기"), false면 한글이 "없는" 줄만 남긴다(한→영 기사의
@@ -65,6 +68,9 @@ export default function ArticleCard({
     const [vaultFolder, setVaultFolder] = useState('');
     const [vaultNewFolder, setVaultNewFolder] = useState('');
     const [vaultFilename, setVaultFilename] = useState(article.title);
+    const [typoraOpened, setTyporaOpened] = useState(false);
+    const [typoraBusy, setTyporaBusy] = useState(false);
+    const displayName = useCurrentUser();
 
     // 카드가 화면(뷰포트)에서 완전히 벗어나면 자동으로 접는다.
     // 단, 편집 중(isEditing)일 때는 저장하지 않은 내용을 보존하기 위해 감시 자체를 하지 않는다.
@@ -97,9 +103,44 @@ export default function ArticleCard({
             alert('폴더를 선택하거나 새 폴더 이름을 입력해주세요.');
             return;
         }
-        onExportToVault(article.id, folder, vaultFilename || article.title, editContent);
+        onExportToVault(article.id, folder, vaultFilename || article.title, article.content, article.title, `article:${article.id}`);
         setShowVaultPopover(false);
         setVaultNewFolder('');
+    };
+
+    // Typora 편집: 백엔드가 기사 내용을 .md 파일로 저장하고 Typora를 실행한다.
+    // Typora에서 저장(Cmd+S)한 뒤, '가져오기'를 눌러야 실제로 DB에 반영된다
+    // (한 번 열었으면 다시 열 필요 없이 바로 '가져오기'만 눌러도 됨).
+    const handleEditInTypora = async () => {
+        setTyporaBusy(true);
+        try {
+            await axios.post(`${API_BASE}/articles/${article.id}/edit-in-typora`);
+            setTyporaOpened(true);
+        } catch (err) {
+            console.error('Typora 편집 시작 에러:', err);
+            alert('Typora를 여는 데 실패했습니다.');
+        } finally {
+            setTyporaBusy(false);
+        }
+    };
+
+    const handleImportFromTypora = async () => {
+        setTyporaBusy(true);
+        try {
+            const res = await axios.post(`${API_BASE}/articles/${article.id}/import-from-typora`);
+            dispatch({ type: 'SET_EDIT_CONTENT', id: article.id, value: undefined });
+            alert(res.data.message);
+            window.location.reload();
+            // 2026-08-12: 이 카드가 article 목록 상태를 직접 갖고 있지 않아서
+            // (부모의 dispatch가 편집 버퍼만 관리) 가장 확실하게 최신 content를
+            // 반영하는 방법은 새로고침. 부모에 fetchArticles 콜백이 이미 있다면
+            // 그걸 호출하는 방식으로 나중에 더 매끄럽게 바꿀 수 있다.
+        } catch (err) {
+            console.error('Typora 가져오기 에러:', err);
+            alert(err.response?.data?.detail || 'Typora에서 가져오는 데 실패했습니다.');
+        } finally {
+            setTyporaBusy(false);
+        }
     };
 
     return (
@@ -120,7 +161,7 @@ export default function ArticleCard({
 
             {isExpanded && (
                 <div className="article-editor-panel">
-                    <div style={{ display: 'flex', gap: '8px', margin: '12px 0' }}>
+                    <div style={{ display: 'flex', gap: '8px', margin: '12px 0', flexWrap: 'wrap', position: 'relative' }}>
                         <button
                             onClick={() => onCleanArticle(article.id)}
                             style={{ backgroundColor: '#0ea5e9', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 'bold' }}
@@ -146,10 +187,28 @@ export default function ArticleCard({
                         </button>
                         )}
                         <button
-                            onClick={() => onToggleEdit(article)}
-                            style={{ backgroundColor: isEditing ? '#6b7280' : '#3b82f6', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 'bold' }}
+                            onClick={handleEditInTypora}
+                            disabled={typoraBusy}
+                            title="Typora에서 열어 편집합니다. 저장(Cmd+S) 후 옆의 '가져오기'를 눌러주세요."
+                            style={{ backgroundColor: '#faad3f', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: typoraBusy ? 'not-allowed' : 'pointer', fontSize: '0.8rem', fontWeight: 'bold', opacity: typoraBusy ? 0.7 : 1 }}
                         >
-                            {isEditing ? '❌ 취소' : '✏️ 편집'}
+                            📝 Typora 편집
+                        </button>
+                        {typoraOpened && (
+                            <button
+                                onClick={handleImportFromTypora}
+                                disabled={typoraBusy}
+                                title="Typora에서 저장한 내용을 다시 불러와 DB에 반영합니다."
+                                style={{ backgroundColor: '#0d9488', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: typoraBusy ? 'not-allowed' : 'pointer', fontSize: '0.8rem', fontWeight: 'bold', opacity: typoraBusy ? 0.7 : 1 }}
+                            >
+                                {typoraBusy ? '⏳ 가져오는 중...' : '📥 Typora에서 가져오기'}
+                            </button>
+                        )}
+                        <button
+                            onClick={handleOpenVaultPopover}
+                            style={{ backgroundColor: '#8b5cf6', color: 'white', border: 'none', padding: '4px 12px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.8rem', fontWeight: 'bold' }}
+                        >
+                            📥 {displayName} 저장소
                         </button>
                         <button
                             onClick={() => onDeleteArticle(article.id)}
@@ -157,6 +216,39 @@ export default function ArticleCard({
                         >
                             🗑️ 삭제
                         </button>
+
+                        {showVaultPopover && (
+                            <div className="vault-export-popover">
+                                <div className="vault-export-row">
+                                    <label>폴더 선택</label>
+                                    <select value={vaultFolder} onChange={(e) => setVaultFolder(e.target.value)}>
+                                        <option value="">-- 선택 --</option>
+                                        {(vaultFolders || []).map(f => (
+                                            <option key={f} value={f}>{f}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div className="vault-export-row">
+                                    <label>또는 새 폴더</label>
+                                    <input
+                                        value={vaultNewFolder}
+                                        onChange={(e) => setVaultNewFolder(e.target.value)}
+                                        placeholder="새 폴더 이름"
+                                    />
+                                </div>
+                                <div className="vault-export-row">
+                                    <label>파일명</label>
+                                    <input
+                                        value={vaultFilename}
+                                        onChange={(e) => setVaultFilename(e.target.value)}
+                                    />
+                                </div>
+                                <div className="vault-export-actions">
+                                    <button onClick={handleConfirmVaultExport} className="vault-export-confirm">확인</button>
+                                    <button onClick={() => setShowVaultPopover(false)} className="vault-export-cancel">취소</button>
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {isTranslating && (
@@ -177,81 +269,22 @@ export default function ArticleCard({
                         </div>
                     )}
 
-                    {isEditing ? (
-                        <div>
-                            <MarkdownEditor
-                                key={article.id}
-                                defaultValue={editContent}
-                                onChange={(markdown) =>
-                                    dispatch({ type: 'SET_EDIT_CONTENT', id: article.id, value: markdown })
-                                }
-                            />
-                            <div style={{ marginTop: '12px', display: 'flex', gap: '8px', alignItems: 'flex-start', flexWrap: 'wrap' }}>
-                                <button
-                                    onClick={() => onSaveContent(article.id)}
-                                    style={{ backgroundColor: '#10b981', color: 'white', border: 'none', padding: '6px 16px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.9rem', fontWeight: 'bold' }}
-                                >
-                                    💾 저장하기
-                                </button>
-                                <button
-                                    onClick={handleOpenVaultPopover}
-                                    style={{ backgroundColor: '#8b5cf6', color: 'white', border: 'none', padding: '6px 16px', borderRadius: '4px', cursor: 'pointer', fontSize: '0.9rem', fontWeight: 'bold' }}
-                                >
-                                    📥 개인저장방에도 저장
-                                </button>
-                            </div>
-
-                            {showVaultPopover && (
-                                <div className="vault-export-popover">
-                                    <div className="vault-export-row">
-                                        <label>폴더 선택</label>
-                                        <select value={vaultFolder} onChange={(e) => setVaultFolder(e.target.value)}>
-                                            <option value="">-- 선택 --</option>
-                                            {(vaultFolders || []).map(f => (
-                                                <option key={f} value={f}>{f}</option>
-                                            ))}
-                                        </select>
-                                    </div>
-                                    <div className="vault-export-row">
-                                        <label>또는 새 폴더</label>
-                                        <input
-                                            value={vaultNewFolder}
-                                            onChange={(e) => setVaultNewFolder(e.target.value)}
-                                            placeholder="새 폴더 이름"
-                                        />
-                                    </div>
-                                    <div className="vault-export-row">
-                                        <label>파일명</label>
-                                        <input
-                                            value={vaultFilename}
-                                            onChange={(e) => setVaultFilename(e.target.value)}
-                                        />
-                                    </div>
-                                    <div className="vault-export-actions">
-                                        <button onClick={handleConfirmVaultExport} className="vault-export-confirm">확인</button>
-                                        <button onClick={() => setShowVaultPopover(false)} className="vault-export-cancel">취소</button>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-                    ) : (
-                        <div className="article-content-preview">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={MarkdownComponents}>
-                                {showKoreanOnly && translatedContent
-                                    ? normalizeParagraphs(
-                                        extractByLanguage(
-                                            translatedContent,
-                                            !/[\uAC00-\uD7A3]/.test(article.content || '')
-                                            // 원문이 영어 기사면(true) 한글 줄만 남기고,
-                                            // 원문이 한글 기사면(false) 영어 줄만 남긴다.
-                                        )
+                    <div className="article-content-preview">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={MarkdownComponents}>
+                            {showKoreanOnly && translatedContent
+                                ? normalizeParagraphs(
+                                    extractByLanguage(
+                                        translatedContent,
+                                        !/[\uAC00-\uD7A3]/.test(article.content || '')
+                                        // 원문이 영어 기사면(true) 한글 줄만 남기고,
+                                        // 원문이 한글 기사면(false) 영어 줄만 남긴다.
                                     )
-                                    : showTranslation && translatedContent
-                                        ? normalizeParagraphs(translatedContent)
-                                        : normalizeParagraphs(article.content)}
-                            </ReactMarkdown>
-                        </div>
-                    )}
+                                )
+                                : showTranslation && translatedContent
+                                    ? normalizeParagraphs(translatedContent)
+                                    : normalizeParagraphs(article.content)}
+                        </ReactMarkdown>
+                    </div>
                 </div>
             )}
         </div>

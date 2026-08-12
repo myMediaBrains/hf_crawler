@@ -61,7 +61,7 @@ from models import (
     SourceStatus, SourceOrigin, CandidateStatus, ContentOrigin, BlockedDomain,
     User, TextGeneration, Delivery, Tag, TagKeyword, TagBlacklist, ArticleTag, TagRelation,
     GitHubRepo, GitHubRepoSnapshot, GitHubReadmeHistory, GitHubRepoTag,
-    InteractionSignal,
+    InteractionSignal, KeywordSearchInterest, UserGenrePreference,
 )
 import tagging
 
@@ -219,6 +219,13 @@ class VaultExportRequest(BaseModel):
     folder: str
     filename: str
     content: str
+    user_id: str
+    source_title: str | None = None
+    source_ref: str | None = None
+    # 2026-08-12: "article:123" / "github:45" 형식. 파일 맨 위에 숨김 주석으로
+    # 심어두고, 개인저장소 '새로고침' 시 이 값을 보고 원본 DB 레코드를 찾아
+    # 파일 내용으로 역갱신한다 (POST /vault/sync). 없으면(예: 순수 메모 파일)
+    # 동기화 대상에서 제외될 뿐 목록에는 그대로 보인다.
 
 
 # ============================================
@@ -306,11 +313,30 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 VAULT_DIR = os.path.expanduser("~/Documents/AI-Vault")
 os.makedirs(VAULT_DIR, exist_ok=True)
 
+TYPORA_EDIT_DIR = os.path.expanduser("~/Documents/AI-Vault/.typora-edit")
+os.makedirs(TYPORA_EDIT_DIR, exist_ok=True)
+# 2026-08-12: '편집' 버튼 전용 임시 폴더 - Vault(개인저장소, DB와 무관한
+# 스냅샷)와는 목적이 다르다. 여기 파일은 "원본 DB 레코드를 고치기 위한
+# 중간 매개체"라서, Typora로 열고 저장한 뒤 '가져오기'를 누르면 이 파일을
+# 다시 읽어 DB를 갱신한다. Vault 폴더 안이지만 '.typora-edit'로 숨김
+# 처리해서 개인저장소 파일 목록(/vault/files)에는 안 잡히게 한다.
 
-def _safe_vault_path(relative_path: str) -> str:
-    """경로 조작(../ 등) 방지 - 반드시 VAULT_DIR 내부인지 검증"""
-    full_path = os.path.normpath(os.path.join(VAULT_DIR, relative_path))
-    if not full_path.startswith(VAULT_DIR):
+
+def _user_vault_root(user_id: str) -> str:
+    """사용자별 Vault 루트: VAULT_DIR/{user_id}/. 사용자마다 완전히 분리된 폴더."""
+    if not user_id or not user_id.strip():
+        raise HTTPException(status_code=400, detail="사용자 등록/로그인 후 이용할 수 있습니다.")
+    safe_user_id = re.sub(r"[^\w\-]", "_", user_id.strip())  # 경로에 쓸 수 없는 문자 방지
+    root = os.path.join(VAULT_DIR, safe_user_id)
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _safe_vault_path(user_id: str, relative_path: str) -> str:
+    """경로 조작(../ 등) 방지 - 반드시 이 사용자의 Vault 루트 내부인지 검증."""
+    user_root = _user_vault_root(user_id)
+    full_path = os.path.normpath(os.path.join(user_root, relative_path))
+    if not full_path.startswith(user_root):
         raise HTTPException(status_code=400, detail="잘못된 경로입니다.")
     return full_path
 
@@ -787,6 +813,18 @@ def register_user(request: UserRegisterRequest, session: Session = Depends(get_s
     }
 
 
+@app.get("/users/list")
+def list_users(session: Session = Depends(get_session)):
+    """로그인 화면에서 '기존 사용자로 로그인'할 때 고를 수 있는 목록."""
+    users = session.exec(select(User).order_by(User.created_at)).all()
+    return {
+        "users": [
+            {"user_id": u.user_id, "display_name": u.display_name}
+            for u in users
+        ]
+    }
+
+
 @app.get("/users/me")
 def get_current_user(user_id: str, session: Session = Depends(get_session)):
     """프론트가 localStorage에 저장해둔 user_id로 등록 여부/표시이름을 확인할 때 사용."""
@@ -1130,6 +1168,7 @@ def _collect_single_keyword(
     major_category: str | None = None,
     search_query: str | None = None,
     region: str | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """
     검색창에 입력된 키워드 하나만 즉시 강제 수집한다 (due 체크 무시, 다른
@@ -1180,6 +1219,41 @@ def _collect_single_keyword(
         else:
             logger.info(f"[collect] '{canonical_name}' 일회성 수집 (영구 등록 안 함)")
 
+    # 2026-08-12: 이 키워드가 여전히 '미분류'(자기 이름을 대분류로 쓰는
+    # placeholder) 상태면, 나중에 관리자가 정식 분류를 해줄 때 이 사용자의
+    # 선호 신호도 소급 반영할 수 있도록 관심을 기록해둔다.
+    if user_id and keyword.tag_id and keyword.id:
+        kw_tag = session.get(Tag, keyword.tag_id)
+        if kw_tag and kw_tag.major_category == kw_tag.name:
+            already = session.exec(
+                select(KeywordSearchInterest).where(
+                    KeywordSearchInterest.keyword_id == keyword.id,
+                    KeywordSearchInterest.user_id == user_id,
+                )
+            ).first()
+            if not already:
+                session.add(KeywordSearchInterest(keyword_id=keyword.id, user_id=user_id))
+                session.commit()
+
+    # 2026-08-12: 이 사용자가 "직접 검색해서" 만들어진/사용된 키워드라면,
+    # 미분류든 정식분류든 상관없이 그 대분류를 이 사용자의 선호로 즉시 기록한다.
+    # 이래야 메인화면 게이팅(대분류 기준)에서 방금 검색한 결과를 바로 볼 수 있다.
+    # _collect_single_keyword()가 실시간 검색(/collect/deep-incremental)과
+    # 선호장르 직접입력(/genres/preferences) 양쪽에서 공통으로 쓰이므로,
+    # 여기 한 곳에 두면 두 경로 모두 자동으로 적용된다.
+    if user_id and keyword.tag_id:
+        kw_tag_for_pref = session.get(Tag, keyword.tag_id)
+        if kw_tag_for_pref:
+            pref_exists = session.exec(
+                select(UserGenrePreference).where(
+                    UserGenrePreference.user_id == user_id,
+                    UserGenrePreference.major_category == kw_tag_for_pref.major_category,
+                )
+            ).first()
+            if not pref_exists:
+                session.add(UserGenrePreference(user_id=user_id, major_category=kw_tag_for_pref.major_category))
+                session.commit()
+
     collector = COLLECTOR_REGISTRY["google_news_search"]
     if not job_control.start_job_with_priority(f"키워드 수집: {keyword.name}"):
         raise HTTPException(
@@ -1187,7 +1261,7 @@ def _collect_single_keyword(
             detail=f"다른 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
         )
     try:
-        result = collector.collect_for_keyword(keyword, session, max_entries=max_entries)
+        result = collector.collect_for_keyword(keyword, session, max_entries=max_entries, user_id=user_id)
         if register:
             keyword.last_collected_at = datetime.now()
             session.add(keyword)
@@ -1264,12 +1338,14 @@ def collect_deep_incremental(
     major_category: str | None = Query(None),
     search_query: str | None = Query(None),
     region: str | None = Query(None),
+    user_id: str | None = Query(None),
     session: Session = Depends(get_session),
 ):
     if keyword and keyword.strip():
         return _collect_single_keyword(
             keyword.strip(), session, months_back, interval_hours, max_entries, register,
             major_category=major_category, search_query=search_query, region=region,
+            user_id=user_id,
         )
 
     stats = scheduler_module.run_tick()
@@ -1307,24 +1383,108 @@ def collect_github(request: GitHubCollectRequest, session: Session = Depends(get
 
 from datetime import timedelta
 
+
+@app.post("/collect/github/trending")
+def collect_trending_github(user_id: str | None = Query(None), session: Session = Depends(get_session)):
+    """
+    'GitHub 저장소' 화면의 '🔄 크롤링 재개' 버튼 전용 (Admin만 사용 가능).
+    두 기준으로 발굴한다:
+    1) 스타 5만개 이상 - 전체 통틀어 이미 검증된 인기 프로젝트
+    2) 최근 1주일 이내 생성 + 이미 스타 1000개 이상 - 신생 프로젝트의 급성장 근사치
+
+    한계(정직하게 밝혀둠): GitHub 공식 Search API는 "이미 있던 오래된 레포가
+    최근 1주일 동안 스타를 몇 개 받았는지"를 직접 조회하는 기능이 없다
+    (비공식 트렌딩 페이지는 스크레이핑이 필요해서 여기선 안 씀). 그래서 2번
+    기준은 "최근 생성 + 이미 인기"로 근사한다 - 오래된 레포가 갑자기
+    떡상한 경우까지는 이 방식으로 못 잡는다.
+    """
+    if user_id != "Admin":
+        raise HTTPException(status_code=403, detail="관리자만 사용할 수 있습니다.")
+
+    if not job_control.start_job_with_priority("GitHub 트렌딩 크롤링 재개"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"다른 작업이 이미 진행 중입니다 (현재: {job_control.current_job()}). 잠시 후 다시 시도해주세요."
+        )
+
+    try:
+        count_popular = github_repository.discover_and_collect(session, "stars:>50000", max_entries=30)
+
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        count_rising = github_repository.discover_and_collect(
+            session, f"stars:>1000 created:>{week_ago}", max_entries=30
+        )
+    finally:
+        job_control.finish_job()
+
+    total = count_popular + count_rising
+    return {
+        "status": "success",
+        "message": (
+            f"트렌딩 크롤링 완료 - 총 {total}건 처리했습니다 "
+            f"(스타 5만+ {count_popular}건 / 최근 1주 신생 인기작 {count_rising}건)."
+        ),
+    }
+
+_RELEVANCE_NORMALIZE = {
+    # 2026-08-12: 예전엔 5단계 한글이었다가 H/M/L 3단계로 축소했다.
+    # 이미 수집된 옛날 데이터도 표에서는 새 표기로 통일해서 보여준다.
+    "매우높음": "H", "높음": "H", "H": "H",
+    "보통": "M", "M": "M",
+    "낮음": "L", "매우낮음": "L", "L": "L",
+}
+
+
+def _normalize_relevance(value: str | None) -> str:
+    if not value:
+        return "-"
+    return _RELEVANCE_NORMALIZE.get(value.strip(), value.strip())
+
+
 @app.get("/github/repos")
-def list_github_repos_table(session: Session = Depends(get_session)):
+def list_github_repos_table(
+    user_id: str | None = Query(None),
+    only_preferred: bool = Query(False),
+    session: Session = Depends(get_session),
+):
     """1단계 - 표(분야/오픈소스/스타수/응용분야/연관성/구성요소), 단어 위주."""
     repos = session.exec(select(GitHubRepo).order_by(GitHubRepo.full_name)).all()
+
+    allowed_repo_ids: set[int] | None = None
+    if only_preferred and user_id and user_id != "Admin":
+        preferred_tag_ids = _user_preferred_tag_ids(session, user_id)
+        if preferred_tag_ids:
+            repo_tag_rows = session.exec(
+                select(GitHubRepoTag.repo_id).where(GitHubRepoTag.tag_id.in_(preferred_tag_ids))
+            ).all()
+            allowed_repo_ids = set(repo_tag_rows)
+        else:
+            allowed_repo_ids = set()  # 선호 태그가 하나도 없으면 빈 목록
+
     result = []
     for repo in repos:
+        if allowed_repo_ids is not None and repo.id not in allowed_repo_ids:
+            continue
         latest_snapshot = session.exec(
             select(GitHubRepoSnapshot).where(GitHubRepoSnapshot.repo_id == repo.id)
             .order_by(GitHubRepoSnapshot.snapshot_at.desc())
         ).first()
+        relevance_norm = _normalize_relevance(repo.relevance_short)
+        # 연관성이 L이면 구성요소는 "비어있는 게 정답"이라 다른 값으로
+        # 대체하지 않는다 (그 외엔 분석이 아직 안 된 경우에 한해 언어로 대체).
+        if relevance_norm == "L":
+            components_display = ""
+        else:
+            components_display = repo.components_short or repo.primary_language or "-"
+
         result.append({
             "id": repo.id,
             "field": repo.field_short or repo.primary_language or "-",
             "full_name": repo.full_name,
             "stars": latest_snapshot.stars if latest_snapshot else 0,
             "application": repo.application_short or "-",
-            "relevance": repo.relevance_short or "-",
-            "components": repo.components_short or repo.primary_language or "-",
+            "relevance": relevance_norm,
+            "components": components_display,
         })
     result.sort(key=lambda r: -r["stars"])
     return {"repos": result}
@@ -1354,6 +1514,7 @@ def get_github_repo_detail(repo_id: int, session: Session = Depends(get_session)
         "detailed_application": repo.detailed_application,
         "detailed_relations": repo.detailed_relations,
         "future_direction": repo.future_direction,
+        "extra_notes": repo.extra_notes,
     }
 
 
@@ -1758,29 +1919,39 @@ def select_preferred_genres(request: GenreSelectRequest, session: Session = Depe
         if not major or not mid or not sub:
             continue
 
-        tag = tagging.get_or_create_tag(session, name=sub, major_category=major, mid_category=mid)
-        was_korean = tagging._contains_hangul(sub)
-        final_search_query = item.search_query or (sub if was_korean else None)
+        # 2026-08-12: 어느 항목에서 실패했는지, 정확히 어떤 예외인지 그대로
+        # 드러나게 한다 - 500만 뜨고 원인을 알 수 없던 문제를 해결하기 위함.
+        try:
+            tag = tagging.get_or_create_tag(session, name=sub, major_category=major, mid_category=mid)
+            was_korean = tagging._contains_hangul(sub)
+            final_search_query = item.search_query or (sub if was_korean else None)
 
-        existing = session.exec(select(Keyword).where(Keyword.name == tag.name)).first()
-        if existing:
-            existing.tag_id = tag.id
-            session.add(existing)
-        else:
-            keyword = Keyword(
-                name=tag.name,
-                tag_id=tag.id,
-                search_query=final_search_query,
-                language="ko" if was_korean else "en",
-                months_back=1,
-                interval_hours=24.0,
+            existing = session.exec(select(Keyword).where(Keyword.name == tag.name)).first()
+            if existing:
+                existing.tag_id = tag.id
+                session.add(existing)
+            else:
+                keyword = Keyword(
+                    name=tag.name,
+                    tag_id=tag.id,
+                    search_query=final_search_query,
+                    language="ko" if was_korean else "en",
+                    months_back=1,
+                    interval_hours=24.0,
+                )
+                session.add(keyword)
+            session.commit()
+            registered += 1
+
+            store_tag_preference(session, tag_id=tag.id, user_id=request.user_id)
+            preferred += 1
+        except Exception as e:
+            session.rollback()
+            logger.exception(f"[genres/select] '{sub}' 처리 중 오류")
+            raise HTTPException(
+                status_code=500,
+                detail=f"'{sub}'({major} > {mid}) 처리 중 오류: {type(e).__name__}: {e}",
             )
-            session.add(keyword)
-        session.commit()
-        registered += 1
-
-        store_tag_preference(session, tag_id=tag.id, user_id=request.user_id)
-        preferred += 1
 
     return {
         "status": "success",
@@ -1788,6 +1959,149 @@ def select_preferred_genres(request: GenreSelectRequest, session: Session = Depe
         "preferred": preferred,
         "message": f"{registered}개 장르를 등록하고 선호 신호로 기록했습니다.",
     }
+
+# ------------------------------------------------------------------
+# 2026-08-12: '선호 장르 선택' 재설계 - 하드코딩된 22개 목록 대신, 데이터편집
+# > 장르목록에 실제 등록된 대분류를 그대로 선택지로 쓴다. 필터링도 태그
+# 하나하나가 아니라 대분류 단위로 바뀐다 (UserGenrePreference).
+# ------------------------------------------------------------------
+
+# 대분류 영문 표기 -> 한글 라벨. 새 대분류가 추가되면 여기만 늘리면 됨
+# (매핑에 없으면 원래 문자열을 그대로 보여준다 - 안 깨짐).
+_MAJOR_CATEGORY_KO = {
+    "AI": "AI",
+    "Health": "건강",
+    "Sports": "스포츠",
+    "Music": "음악",
+    "Movie": "영화",
+    "Politics": "정치",
+    "Economy": "경제",
+    "Books": "도서",
+    "Creators": "크리에이터",
+    "Life": "라이프스타일",
+    "Culture": "문화",
+    "Tech": "기술",
+    "Entertainment": "엔터테인먼트",
+}
+
+
+@app.get("/genres/major-categories")
+def list_major_categories(user_id: str | None = Query(None), session: Session = Depends(get_session)):
+    """
+    '선호 장르 선택'의 선택지 - 데이터편집(장르목록)에 실제 등록된 대분류만
+    보여준다. 아직 관리자가 정식 분류 안 한 '미분류' placeholder(자기 이름을
+    대분류로 쓰는 것)는 사용자에게 선택지로 노출하지 않는다.
+
+    2026-08-12: user_id를 넘기면, 이 사용자가 이미 선택해둔 대분류를
+    "selected": true로 표시한다 - 다시 열었을 때 기존 선택이 체크된 채로
+    보이게 하기 위함. Admin은 항상 전부 selected(무제한 열람이므로).
+    """
+    keywords = session.exec(select(Keyword).where(Keyword.tag_id.is_not(None))).all()
+    majors = set()
+    for kw in keywords:
+        tag = session.get(Tag, kw.tag_id)
+        if tag and tag.major_category != tag.name:
+            majors.add(tag.major_category)
+
+    if user_id == "Admin":
+        preferred = set(majors)
+    elif user_id:
+        preferred = _user_preferred_major_categories(session, user_id)
+    else:
+        preferred = set()
+
+    result = [
+        {"value": m, "label_ko": _MAJOR_CATEGORY_KO.get(m, m), "selected": m in preferred}
+        for m in sorted(majors)
+    ]
+    return {"major_categories": result}
+
+
+def _user_preferred_major_categories(session: Session, user_id: str) -> set[str]:
+    rows = session.exec(
+        select(UserGenrePreference.major_category).where(UserGenrePreference.user_id == user_id)
+    ).all()
+    return set(rows)
+
+
+class GenrePreferenceSaveRequest(BaseModel):
+    user_id: str
+    major_categories: list[str] = []
+    # 직접 입력 - 하나만 받는다. 대분류/중분류/소분류 전부 이 값 그대로 등록되고
+    # (관리자가 나중에 조정), 이 사용자에게는 즉시 이 대분류 이름으로 선호가 잡힌다.
+    custom_entry: str | None = None
+
+
+@app.post("/genres/preferences")
+def save_genre_preferences(request: GenrePreferenceSaveRequest, session: Session = Depends(get_session)):
+    if not request.user_id or not request.user_id.strip():
+        raise HTTPException(status_code=400, detail="사용자 등록/로그인 후 이용할 수 있습니다.")
+
+    saved = 0
+
+    def _add_preference(major: str) -> bool:
+        major = major.strip()
+        if not major:
+            return False
+        exists = session.exec(
+            select(UserGenrePreference).where(
+                UserGenrePreference.user_id == request.user_id,
+                UserGenrePreference.major_category == major,
+            )
+        ).first()
+        if exists:
+            return False
+        session.add(UserGenrePreference(user_id=request.user_id, major_category=major))
+        return True
+
+    for major in request.major_categories:
+        if _add_preference(major):
+            saved += 1
+
+    custom_created = None
+    custom_message = None
+    if request.custom_entry and request.custom_entry.strip():
+        name = request.custom_entry.strip()
+        canonical_name = (
+            tagging._translate_to_english_tag_name(name)
+            if tagging._contains_hangul(name) else name
+        )
+
+        # 2026-08-12: 백그라운드 스케줄러를 기다리지 않고 즉시(실시간) 수집한다.
+        # _collect_single_keyword()가 태그/키워드 생성(대분류/중분류/소분류 전부
+        # 이 값 그대로, 요청하신 대로) + 실제 검색수집 + 나중에 관리자가 정식
+        # 분류할 때 쓸 관심기록까지 전부 한 번에 처리해준다 - 실시간 검색창에서
+        # 새 키워드를 등록할 때와 완전히 동일한 경로를 재사용.
+        try:
+            collect_result = _collect_single_keyword(
+                name, session,
+                months_back=1, interval_hours=24.0, max_entries=20, register=True,
+                user_id=request.user_id,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(f"[genres/preferences] 직접입력 '{name}' 즉시 수집 실패")
+            raise HTTPException(status_code=500, detail=f"'{name}' 수집 중 오류: {type(e).__name__}: {e}")
+
+        keyword = session.exec(select(Keyword).where(Keyword.name == canonical_name)).first()
+        if keyword and keyword.tag_id:
+            tag = session.get(Tag, keyword.tag_id)
+            if tag:
+                if _add_preference(tag.major_category):
+                    saved += 1
+                custom_created = tag.name
+                custom_message = collect_result.get("message")
+
+    session.commit()
+
+    parts = []
+    if saved:
+        parts.append(f"{saved}개 장르를 선호로 저장했습니다.")
+    if custom_created:
+        parts.append(f"'{custom_created}' 즉시 수집 완료 - {custom_message or ''}")
+    return {"status": "success", "message": " ".join(parts) or "변경 사항이 없습니다."}
+
 
 # 3-2. 키워드 목록 조회 - 키워드 관리 패널(전체 보기)에서 쓸 통계(건수/게시일 범위) 포함
 @app.get("/keywords")
@@ -1842,20 +2156,10 @@ def list_sources(session: Session = Depends(get_session)):
     result = []
     for s in sources:
         tag = _tag_for(s.tag_id)
-        # '해당자료 URL' - 이 소스에서 가장 최근에 수집된 기사의 실제 원문 URL.
-        # Source.url(=출처 URL)은 재수집에 쓰는 구글뉴스 검색/피드 URL이라
-        # 사람이 클릭해서 보기엔 안 맞음 - 실제 기사 링크는 Article.url에 이미
-        # 올바르게 저장돼 있다(collectors.py가 구글 리다이렉트를 미리 해제해둠).
-        latest_article = session.exec(
-            select(Article)
-            .where(Article.source == s.name)
-            .order_by(Article.collected_at.desc())
-        ).first()
         result.append({
             "id": s.id,
             "name": s.name,
             "url": s.url,
-            "article_url": latest_article.url if latest_article else None,
             "major_category": tag.major_category if tag else None,
             # 2026-08-09: category(문자열) 대신 tag_id로 조인한 major_category.
             "sensitive": tag.sensitive if tag else False,
@@ -1892,14 +2196,6 @@ def evaluate_sources(session: Session = Depends(get_session)):
         lengths = [len(a.content) for a in articles if a.content]
         avg_length = mean(lengths) if lengths else 0.0
 
-        # '해당자료 URL' - 이미 조회해둔 articles 중 가장 최근 것의 실제 URL.
-        # (list_sources와 같은 이유 - Source.url은 재수집용 검색 URL이라
-        # 클릭해서 보기엔 안 맞고, Article.url이 실제 기사 원문 링크다.)
-        latest_article = (
-            max(articles, key=lambda a: a.collected_at or datetime.min)
-            if articles else None
-        )
-
         score_result = source_scoring.compute_score(
             article_count=article_count,
             fail_count=s.fail_count,
@@ -1913,7 +2209,6 @@ def evaluate_sources(session: Session = Depends(get_session)):
             "id": s.id,
             "name": s.name,
             "url": s.url,
-            "article_url": latest_article.url if latest_article else None,
             "status": s.status,
             "article_count": article_count,
             "fail_count": s.fail_count,
@@ -2236,30 +2531,543 @@ async def upload_image(file: UploadFile = File(...)):
     }
 
 
-# 개인저장방(Vault) - 폴더 목록 조회
+# 개인저장방(Vault) - 폴더 목록 조회 (이 사용자 소유 폴더만)
 @app.get("/vault/folders")
-def list_vault_folders():
+def list_vault_folders(user_id: str = Query(...)):
+    user_root = _user_vault_root(user_id)
     folders = [
-        d for d in os.listdir(VAULT_DIR)
-        if os.path.isdir(os.path.join(VAULT_DIR, d))
+        d for d in os.listdir(user_root)
+        if os.path.isdir(os.path.join(user_root, d)) and not d.startswith(".")
     ]
     return {"folders": sorted(folders)}
 
 
-# 개인저장방(Vault) - 내보내기 (DB와 무관한 1회성 스냅샷 저장)
+# ------------------------------------------------------------------
+# 관리자 - 미분류 키워드 처리. 실시간 검색 등으로 자동 등록됐지만 아직
+# 정식 대분류/중분류가 없는(Tag.major_category == Tag.name인 placeholder)
+# 키워드를 모아서 보여주고, 정식 분류를 붙이면 그동안 검색했던 사용자들의
+# 선호 신호까지 소급으로 남긴다.
+# ------------------------------------------------------------------
+
+@app.get("/admin/unclassified-keywords")
+def list_unclassified_keywords(session: Session = Depends(get_session)):
+    keywords = session.exec(select(Keyword).where(Keyword.tag_id.is_not(None))).all()
+
+    result = []
+    for kw in keywords:
+        tag = session.get(Tag, kw.tag_id)
+        if not tag or tag.major_category != tag.name:
+            continue  # 이미 정식 분류가 붙은 키워드는 제외
+
+        interests = session.exec(
+            select(KeywordSearchInterest).where(KeywordSearchInterest.keyword_id == kw.id)
+        ).all()
+        interested_users = sorted({i.user_id for i in interests})
+
+        result.append({
+            "keyword_id": kw.id,
+            "tag_id": tag.id,
+            "name": kw.name,
+            "interested_users": interested_users,
+            "interested_count": len(interested_users),
+        })
+
+    result.sort(key=lambda x: -x["interested_count"])
+    return {"keywords": result}
+
+
+class ClassifyKeywordRequest(BaseModel):
+    keyword_id: int
+    major_category: str
+    mid_category: str
+
+
+@app.post("/admin/classify-keyword")
+def classify_keyword(request: ClassifyKeywordRequest, session: Session = Depends(get_session)):
+    keyword = session.get(Keyword, request.keyword_id)
+    if not keyword or not keyword.tag_id:
+        raise HTTPException(status_code=404, detail="해당 키워드를 찾을 수 없습니다.")
+
+    tag = session.get(Tag, keyword.tag_id)
+    if not tag:
+        raise HTTPException(status_code=404, detail="연결된 태그를 찾을 수 없습니다.")
+
+    tag.major_category = request.major_category.strip()
+    tag.mid_category = request.mid_category.strip()
+    session.add(tag)
+    session.commit()
+    # InteractionSignal은 append-only라 과거 신호는 안 건드린다 - get_profile()이
+    # tag.major_category를 그때그때 조회해서 쓰도록 이미 바꿔뒀으므로, 이 갱신만으로
+    # 과거 신호들도 자동으로 새 분류를 반영하게 된다.
+
+    interests = session.exec(
+        select(KeywordSearchInterest).where(KeywordSearchInterest.keyword_id == keyword.id)
+    ).all()
+    interested_users = sorted({i.user_id for i in interests})
+    for user_id in interested_users:
+        store_tag_preference(session, tag_id=tag.id, user_id=user_id)
+        # 2026-08-12: 메인화면 게이팅은 이제 대분류(UserGenrePreference) 기준이라,
+        # 여기서도 새로 분류된 대분류를 이 사용자의 선호로 같이 남겨야 실제로 보인다.
+        already = session.exec(
+            select(UserGenrePreference).where(
+                UserGenrePreference.user_id == user_id,
+                UserGenrePreference.major_category == tag.major_category,
+            )
+        ).first()
+        if not already:
+            session.add(UserGenrePreference(user_id=user_id, major_category=tag.major_category))
+
+    for i in interests:
+        session.delete(i)
+    session.commit()
+
+    return {
+        "status": "success",
+        "message": (
+            f"'{keyword.name}'을(를) '{request.major_category} > {request.mid_category}'로 분류했습니다. "
+            f"소급 반영된 사용자 {len(interested_users)}명: {', '.join(interested_users) or '없음'}"
+        ),
+    }
+
+
+# ------------------------------------------------------------------
+# GitHub 저장소 개인화 - '선호 장르 선택'과 동일한 원리로, 그동안 모아둔
+# GitHub 태그 중 관심 있는 것만 선택하면 그 사용자의 선호 신호로 기록되고,
+# 목록 화면에서 "내 관심분야만 보기"로 필터링할 수 있다.
+# ------------------------------------------------------------------
+
+@app.get("/github/fields")
+def list_github_fields(user_id: str | None = Query(None), session: Session = Depends(get_session)):
+    """그동안 GitHub 레포에 실제로 붙은 태그들(=다른 사람이 모아온 분야) 목록."""
+    tag_ids = session.exec(select(GitHubRepoTag.tag_id).distinct()).all()
+    fields = []
+    for tag_id in tag_ids:
+        tag = session.get(Tag, tag_id)
+        if tag:
+            fields.append({
+                "tag_id": tag.id,
+                "name": tag.name,
+                "major_category": tag.major_category,
+                "mid_category": tag.mid_category,
+            })
+    fields.sort(key=lambda f: f["name"])
+
+    has_preferences = False
+    preferred_tag_ids: set[int] = set()
+    if user_id == "Admin":
+        has_preferences = True
+        preferred_tag_ids = {f["tag_id"] for f in fields}
+    elif user_id:
+        preferred_tag_ids = _user_preferred_tag_ids(session, user_id)
+        has_preferences = bool(preferred_tag_ids & {f["tag_id"] for f in fields})
+
+    for f in fields:
+        f["selected"] = f["tag_id"] in preferred_tag_ids
+
+    return {"fields": fields, "has_preferences": has_preferences}
+
+
+class GitHubFieldSelectRequest(BaseModel):
+    tag_ids: list[int] = []
+    custom_field: str | None = None
+    user_id: str | None = None
+
+
+@app.post("/github/select-fields")
+def select_github_fields(request: GitHubFieldSelectRequest, session: Session = Depends(get_session)):
+    count = 0
+    for tag_id in request.tag_ids:
+        tag = session.get(Tag, tag_id)
+        if tag:
+            store_tag_preference(session, tag_id=tag.id, user_id=request.user_id)
+            count += 1
+
+    custom_message = None
+    if request.custom_field and request.custom_field.strip():
+        field = request.custom_field.strip()
+        tag = tagging.get_or_create_tag(session, name=field, major_category="Tech", mid_category="Open Source")
+        store_tag_preference(session, tag_id=tag.id, user_id=request.user_id)
+        count += 1
+
+        # 2026-08-12: 백그라운드 크롤링 재개(Admin 전용)를 기다리지 않고,
+        # 개인 사용자가 직접 입력한 분야는 즉시(실시간) GitHub를 검색해서
+        # 바로 저장소에 가져온다.
+        try:
+            found = github_repository.discover_and_collect(session, field, max_entries=10)
+            custom_message = f"'{field}' 실시간 검색으로 {found}건 가져왔습니다."
+        except Exception as e:
+            logger.warning(f"[github/select-fields] '{field}' 즉시 수집 실패: {e}")
+            custom_message = f"'{field}' 관심분야는 저장했지만, 실시간 검색은 실패했습니다."
+
+    message = f"관심 분야 {count}개를 저장했습니다."
+    if custom_message:
+        message += f" {custom_message}"
+    return {"status": "success", "message": message}
+
+
+def _user_preferred_tag_ids(session: Session, user_id: str) -> set[int]:
+    """이 사용자가 지금까지 긍정 신호를 남긴 태그 id 집합 (get_profile 재사용)."""
+    profile = get_profile(session, user_id=user_id)
+    tag_name_to_id = {
+        row[0]: row[1]
+        for row in session.exec(select(Tag.name, Tag.id)).all()
+    }
+    return {tag_name_to_id[name] for name in profile.keys() if name in tag_name_to_id}
+
+
+# 2026-08-12: 메인화면에서 "선호 장르(대분류)를 선택하기 전까지는 자료를
+# 숨기고 안내만 보여준다"를 판단하는 체크. UserGenrePreference(대분류 단위)
+# 기준으로 바뀌었다 - 예전엔 태그 단위(_user_preferred_tag_ids)였는데, 그러면
+# "대분류를 선택하면 그 밑 전체가 보인다"는 요구사항을 못 지켰다.
+@app.get("/personalization/has-preferences")
+def has_preferences(user_id: str = Query(...), session: Session = Depends(get_session)):
+    if user_id == "Admin":
+        # 2026-08-12: Admin은 기본값으로 전체 열람 - 게이팅 대상이 아니다.
+        return {"has_preferences": True}
+    majors = _user_preferred_major_categories(session, user_id)
+    return {"has_preferences": len(majors) > 0}
+
+
 @app.post("/vault/export")
 def export_to_vault(request: VaultExportRequest):
-    folder_path = _safe_vault_path(request.folder)
+    folder_path = _safe_vault_path(request.user_id, request.folder)
     os.makedirs(folder_path, exist_ok=True)
 
     filename = request.filename if request.filename.endswith(".md") else f"{request.filename}.md"
     filename = _unique_vault_filename(folder_path, filename)
     filepath = os.path.join(folder_path, filename)
 
+    content = request.content
+    if request.source_title and not content.lstrip().startswith("# "):
+        content = f"# {request.source_title}\n\n{content}"
+    if request.source_ref:
+        content = f"<!-- hf-source: {request.source_ref} -->\n{content}"
+
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(request.content)
+        f.write(content)
 
     return {"status": "success", "path": filepath, "filename": filename}
+
+
+def _open_in_typora(filepath: str):
+    """macOS 'open -a Typora <파일>'로 Typora를 실행해 그 파일을 연다."""
+    try:
+        subprocess.run(["open", "-a", "Typora", filepath], check=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="'open' 명령을 찾을 수 없습니다 (macOS 전용 기능입니다).")
+    except subprocess.CalledProcessError:
+        raise HTTPException(status_code=500, detail="Typora 실행에 실패했습니다. Typora가 설치되어 있는지 확인해주세요.")
+
+
+# ------------------------------------------------------------------
+# Typora 편집 연동 - '편집' 버튼 전용. Vault(개인저장소)와는 별개로,
+# 원본 DB 레코드(기사/GitHub 레포 상세)를 Typora로 열어 고치고, 저장한
+# 파일을 다시 읽어들여 DB를 업그레이드한다.
+# ------------------------------------------------------------------
+
+# 8-1. 기사 - Typora로 편집 시작 (파일 생성 + Typora 실행)
+@app.post("/articles/{article_id}/edit-in-typora")
+def edit_article_in_typora(article_id: int, session: Session = Depends(get_session)):
+    article = session.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없습니다.")
+
+    filepath = os.path.join(TYPORA_EDIT_DIR, f"article_{article_id}.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"# {article.title}\n\n{article.content or ''}")
+
+    _open_in_typora(filepath)
+    return {"status": "success", "message": "Typora에서 열었습니다. 저장 후 '가져오기'를 눌러주세요."}
+
+
+# 8-2. 기사 - Typora에서 저장한 내용을 다시 읽어와 DB 갱신
+@app.post("/articles/{article_id}/import-from-typora")
+def import_article_from_typora(article_id: int, session: Session = Depends(get_session)):
+    article = session.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없습니다.")
+
+    filepath = os.path.join(TYPORA_EDIT_DIR, f"article_{article_id}.md")
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="먼저 '편집' 버튼으로 Typora에서 열어주세요.")
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    # edit-in-typora가 맨 앞에 붙여둔 "# 제목" 줄은 본문(content)에는
+    # 중복 저장하지 않도록 제거한다 (제목은 article.title이 따로 관리).
+    lines = raw.split("\n")
+    if lines and lines[0].strip().startswith("# "):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    new_content = "\n".join(lines).strip()
+
+    article.content = new_content
+    article.origin = ContentOrigin.USER_EDITED
+    article.model_used = None
+    session.commit()
+
+    return {"status": "success", "message": f"'{article.title}' 기사를 Typora에서 가져와 저장했습니다."}
+
+
+# GitHub 레포 상세 섹션 헤더 <-> DB 필드 매핑 (Typora 왕복용).
+# 순서가 곧 Typora에 보여줄 섹션 순서다.
+_GITHUB_DETAIL_SECTIONS = [
+    ("상세 개요", "detailed_overview"),
+    ("상세 응용분야", "detailed_application"),
+    ("구성요소와의 연관성", "detailed_relations"),
+    ("향후 발전 방향", "future_direction"),
+]
+
+
+def _build_github_detail_markdown(repo: "GitHubRepo") -> str:
+    parts = [f"# {repo.full_name}"]
+    for heading, field in _GITHUB_DETAIL_SECTIONS:
+        parts.append(f"\n## {heading}\n\n{getattr(repo, field) or ''}")
+    if repo.extra_notes:
+        parts.append(f"\n{repo.extra_notes}")
+    return "\n".join(parts)
+
+
+def _parse_github_detail_markdown(raw: str) -> dict:
+    """
+    Typora에서 저장한 md를 "## 헤더" 기준으로 다시 나눈다. 알려진 4개 헤더는
+    해당 DB 필드로, 그 외 새로 추가된 "##" 섹션은 헤더명을 보존한 채
+    extra_notes에 이어붙인다 (2026-08-12 - 새 섹션을 추가해도 안 버려지게).
+    """
+    known_headings = {h: f for h, f in _GITHUB_DETAIL_SECTIONS}
+    sections: dict[str, str] = {}
+    extra_chunks: list[str] = []
+
+    current_heading = None
+    current_lines: list[str] = []
+
+    def _flush():
+        if current_heading is None:
+            return
+        text = "\n".join(current_lines).strip()
+        if current_heading in known_headings:
+            sections[known_headings[current_heading]] = text
+        else:
+            extra_chunks.append(f"## {current_heading}\n\n{text}")
+
+    for line in raw.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            _flush()
+            current_heading = stripped[3:].strip()
+            current_lines = []
+        elif stripped.startswith("# "):
+            continue  # 맨 위 "# owner/repo" 제목 줄은 건너뜀
+        else:
+            current_lines.append(line)
+    _flush()
+
+    return {
+        "fields": sections,
+        "extra_notes": "\n\n".join(extra_chunks).strip() or None,
+    }
+
+
+# 8-3. GitHub 레포 상세 - Typora로 편집 시작
+@app.post("/github/repos/{repo_id}/edit-in-typora")
+def edit_github_repo_in_typora(repo_id: int, session: Session = Depends(get_session)):
+    repo = session.get(GitHubRepo, repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="해당 레포를 찾을 수 없습니다.")
+
+    filepath = os.path.join(TYPORA_EDIT_DIR, f"github_{repo_id}.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(_build_github_detail_markdown(repo))
+
+    _open_in_typora(filepath)
+    return {"status": "success", "message": "Typora에서 열었습니다. 저장 후 '가져오기'를 눌러주세요."}
+
+
+# 8-4. GitHub 레포 상세 - Typora에서 저장한 내용을 다시 읽어와 DB 갱신
+@app.post("/github/repos/{repo_id}/import-from-typora")
+def import_github_repo_from_typora(repo_id: int, session: Session = Depends(get_session)):
+    repo = session.get(GitHubRepo, repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="해당 레포를 찾을 수 없습니다.")
+
+    filepath = os.path.join(TYPORA_EDIT_DIR, f"github_{repo_id}.md")
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="먼저 '편집' 버튼으로 Typora에서 열어주세요.")
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    parsed = _parse_github_detail_markdown(raw)
+    for field, value in parsed["fields"].items():
+        setattr(repo, field, value)
+    repo.extra_notes = parsed["extra_notes"]
+
+    session.add(repo)
+    session.commit()
+
+    return {"status": "success", "message": f"'{repo.full_name}' 상세문서를 Typora에서 가져와 저장했습니다."}
+
+
+# ------------------------------------------------------------------
+# 개인저장소(Vault) 목록/열기 - 메인화면 '{사용자} 저장소' 버튼 전용.
+# ------------------------------------------------------------------
+
+# hf-source 숨김 주석 패턴 - "<!-- hf-source: article:123 -->" 또는 "github:45"
+_VAULT_SOURCE_REF_RE = re.compile(r"^<!--\s*hf-source:\s*(article|github):(\d+)\s*-->\n?")
+
+
+def _strip_source_ref(raw: str) -> tuple[str | None, int | None, str]:
+    """맨 위 hf-source 주석을 떼어내고 (타입, id, 나머지 본문)을 반환. 주석이 없으면 (None, None, raw)."""
+    m = _VAULT_SOURCE_REF_RE.match(raw)
+    if not m:
+        return None, None, raw
+    return m.group(1), int(m.group(2)), raw[m.end():]
+
+
+def _list_vault_files_data(user_id: str) -> list[dict]:
+    """GET /vault/files와 POST /vault/sync가 공유하는 목록 생성 로직. 이 사용자 폴더만."""
+    user_root = _user_vault_root(user_id)
+    result = []
+    for root, dirs, files in os.walk(user_root):
+        # .typora-edit(편집용 임시 폴더)는 개인저장소 목록에서 제외
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if os.path.basename(root).startswith("."):
+            continue
+
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            filepath = os.path.join(root, filename)
+            folder = os.path.relpath(root, user_root)
+            if folder == ".":
+                folder = "(루트)"
+
+            title = filename
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                _, _, body = _strip_source_ref(raw)
+                first_line = body.split("\n", 1)[0].strip()
+                if first_line.startswith("# "):
+                    title = first_line[2:].strip()
+            except Exception:
+                pass
+
+            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+            result.append({
+                "folder": folder,
+                "filename": filename,
+                "title": title,
+                "last_modified": mtime.strftime("%Y-%m-%d %H:%M"),
+                "last_modified_ts": mtime.timestamp(),
+            })
+
+    result.sort(key=lambda x: x["last_modified_ts"], reverse=True)
+    return result
+
+
+# 8-5. 개인저장소 - 폴더/파일/원본제목/최종수정일시 목록 (이 사용자 것만)
+@app.get("/vault/files")
+def list_vault_files(user_id: str = Query(...)):
+    return {"files": _list_vault_files_data(user_id)}
+
+
+# 8-5-2. 개인저장소 - '새로고침' 전용. 목록 갱신 + hf-source가 연결된 파일은
+# 원본 DB(기사/GitHub 레포)에 파일 내용을 역으로 반영한다.
+@app.post("/vault/sync")
+def sync_vault_to_db(user_id: str = Query(...), session: Session = Depends(get_session)):
+    updated_articles = 0
+    updated_repos = 0
+    linked = 0
+    unlinked = 0
+
+    user_root = _user_vault_root(user_id)
+    for root, dirs, files in os.walk(user_root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if os.path.basename(root).startswith("."):
+            continue
+
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            filepath = os.path.join(root, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            except Exception:
+                continue
+
+            ref_type, ref_id, body = _strip_source_ref(raw)
+            if ref_type is None:
+                unlinked += 1
+                continue
+            linked += 1
+
+            if ref_type == "article":
+                article = session.get(Article, ref_id)
+                if not article:
+                    continue
+                lines = body.split("\n")
+                if lines and lines[0].strip().startswith("# "):
+                    lines = lines[1:]
+                    while lines and not lines[0].strip():
+                        lines = lines[1:]
+                new_content = "\n".join(lines).strip()
+                if new_content and new_content != (article.content or "").strip():
+                    article.content = new_content
+                    article.origin = ContentOrigin.USER_EDITED
+                    article.model_used = None
+                    session.add(article)
+                    updated_articles += 1
+
+            elif ref_type == "github":
+                repo = session.get(GitHubRepo, ref_id)
+                if not repo:
+                    continue
+                parsed = _parse_github_detail_markdown(body)
+                changed = False
+                for field, value in parsed["fields"].items():
+                    if getattr(repo, field, None) != value:
+                        setattr(repo, field, value)
+                        changed = True
+                if repo.extra_notes != parsed["extra_notes"]:
+                    repo.extra_notes = parsed["extra_notes"]
+                    changed = True
+                if changed:
+                    session.add(repo)
+                    updated_repos += 1
+
+    session.commit()
+
+    return {
+        "status": "success",
+        "message": (
+            f"저장소 파일 {linked + unlinked}개 확인 — "
+            f"기사 {updated_articles}건 · GitHub 레포 {updated_repos}건을 원본 DB에 반영했습니다. "
+            f"(원본과 연결 안 된 파일 {unlinked}개는 목록만 갱신)"
+        ),
+        "files": _list_vault_files_data(user_id),
+    }
+
+
+class VaultOpenRequest(BaseModel):
+    folder: str
+    filename: str
+    user_id: str
+
+
+# 8-6. 개인저장소 - 파일명 클릭 시 Typora로 열기
+@app.post("/vault/open-in-typora")
+def open_vault_file_in_typora(request: VaultOpenRequest):
+    folder_path = _safe_vault_path(request.user_id, request.folder if request.folder != "(루트)" else "")
+    filepath = os.path.join(folder_path, request.filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    _open_in_typora(filepath)
+    return {"status": "success", "message": f"'{request.filename}'을(를) Typora에서 열었습니다."}
 
 
 # ============================================
@@ -2418,6 +3226,7 @@ def _serialize_article_preview(a: Article) -> dict:
 def get_articles(
     keyword: str = Query(None),
     tag_id: int | None = Query(None),
+    user_id: str | None = Query(None),
     session: Session = Depends(get_session)
 ):
     # 2026-08-10: 키워드별 현황 버튼이 이제 태그 고유번호로 정확히 조회한다.
@@ -2433,6 +3242,26 @@ def get_articles(
         return {"articles": [_serialize_article_preview(a) for a in articles]}
 
     if not keyword:
+        # 2026-08-12: 메인화면 기본 목록(키워드/태그 필터 없음)은 이제
+        # user_id가 있으면 이 사용자가 '선호 장르 선택'에서 고른 대분류에
+        # 속한 기사만 보여준다(대분류 밑의 모든 태그를 자동으로 포함 -
+        # 개별 태그 단위가 아니라 대분류 단위로 필터링). 아직 대분류를
+        # 하나도 선택 안 했으면 빈 목록 - 프론트가 안내 문구를 보여준다.
+        if user_id and user_id != "Admin":
+            preferred_majors = _user_preferred_major_categories(session, user_id)
+            if not preferred_majors:
+                return {"articles": []}
+            query = (
+                select(Article)
+                .join(ArticleTag, ArticleTag.article_id == Article.id)
+                .join(Tag, Tag.id == ArticleTag.tag_id)
+                .where(Tag.major_category.in_(preferred_majors))
+                .order_by(Article.id.desc())
+                .distinct()
+            )
+            articles = session.exec(query).all()
+            return {"articles": [_serialize_article_preview(a) for a in articles]}
+
         query = select(Article).order_by(Article.id.desc())
         articles = session.exec(query).all()
         return {"articles": [_serialize_article_preview(a) for a in articles]}

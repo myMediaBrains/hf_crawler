@@ -153,7 +153,9 @@ class GoogleNewsSearchCollector(BaseCollector):
             require_korean_content=require_korean_content,
         )
 
-    def collect_for_keyword(self, keyword: Keyword, session: Session, max_entries: int = 20) -> CollectResult:
+    def collect_for_keyword(
+        self, keyword: Keyword, session: Session, max_entries: int = 20, user_id: str | None = None
+    ) -> CollectResult:
         # 2026-08-09 수정: search_query/language(지역)가 반영 안 되고 예전 단순
         # 버전으로 되돌아가 있던 버그. search_query가 있으면(자유 검색 문구) 그걸
         # 쓰고, keyword.language="ko"면 한국 지역으로 검색한다.
@@ -169,6 +171,7 @@ class GoogleNewsSearchCollector(BaseCollector):
             track_domains=True,
             max_entries=max_entries,
             require_korean_content=is_korean,
+            user_id=user_id,
         )
 
     @staticmethod
@@ -203,6 +206,7 @@ class GoogleNewsSearchCollector(BaseCollector):
         track_domains: bool,
         max_entries: int = 20,
         require_korean_content: bool = False,
+        user_id: str | None = None,
     ) -> CollectResult:
         new_count = 0
         discovered: list[tuple[str, str]] = []
@@ -293,10 +297,13 @@ class GoogleNewsSearchCollector(BaseCollector):
 
             # 키워드 검색 수집 = 사용자가 검색창에 직접 입력한 키워드에서 나온 결과이므로
             # RSS 고정 수집보다 더 강한 신호로 취급한다(weight=0.5, signal_type="explicit").
+            # 2026-08-12: user_id를 넘겨서, 이 신호가 실제로 검색을 트리거한
+            # 사용자에게 귀속되도록 한다 (예전엔 항상 None으로 익명 처리됐음 -
+            # 개인화 프로필/get_profile()이 "누가 검색했는지"를 놓치는 원인이었음).
             classify_and_store(
                 session, article.title, article.content or "",
                 source="extension", signal_type="explicit", weight=0.5,
-                article_id=article.id,
+                article_id=article.id, user_id=user_id,
             )
             new_count += 1
 

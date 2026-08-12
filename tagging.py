@@ -25,7 +25,7 @@ import할 때 순환참조가 생기지 않는다.
 import re
 import logging
 from sqlmodel import Session, select
-from sqlmodel import func as sql_funcv
+from sqlmodel import func as sql_func
 
 from models import Tag, TagKeyword, TagBlacklist, ArticleTag
 

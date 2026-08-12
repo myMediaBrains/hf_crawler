@@ -342,6 +342,36 @@ class Source(SQLModel, table=True):
 # 사용자 등록 키워드 — "무엇을 언제 재검색할지"만 담당 (분류는 Tag로 위임)
 # ============================================================
 
+class UserGenrePreference(SQLModel, table=True):
+    """
+    2026-08-12: '선호 장르 선택'은 이제 태그 하나하나가 아니라 '대분류' 단위로
+    동작한다. 사용자가 대분류를 선택하면, 그 대분류 밑의 모든 키워드(지금
+    있는 것 + 나중에 새로 생기는 것 전부)가 자동으로 그 사용자에게 보인다.
+    """
+    __tablename__ = "user_genre_preferences"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(index=True)
+    major_category: str = Field(index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class KeywordSearchInterest(SQLModel, table=True):
+    """
+    2026-08-12: 실시간 검색으로 새 키워드가 만들어질 때, 아직 '미분류'
+    (Tag.major_category == Tag.name인 placeholder 상태) 키워드라면 누가
+    검색했는지 여기에 기록해둔다. 나중에 관리자가 이 키워드를 정식 장르로
+    분류하면(POST /admin/classify-keyword), 여기 기록된 사용자들의 선호
+    신호를 소급으로 남겨준다. 처리가 끝나면 해당 행은 삭제한다(중복 처리 방지).
+    """
+    __tablename__ = "keyword_search_interests"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    keyword_id: int = Field(foreign_key="keywords.id", index=True)
+    user_id: str = Field(index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Keyword(SQLModel, table=True):
     """
     백그라운드 검색 구독. 2026-08-09부터 분류(major_category/mid_category)는
@@ -510,6 +540,10 @@ class GitHubRepo(SQLModel, table=True):
     detailed_application: Optional[str] = None
     detailed_relations: Optional[str] = None
     future_direction: Optional[str] = None
+    extra_notes: Optional[str] = None
+    # 2026-08-12: Typora 편집 시 알려진 4개 섹션(상세개요/상세응용분야/구성요소연관성/
+    # 향후방향) 헤더가 아닌 새 "##" 섹션을 추가하면, 그 내용을 잃어버리지 않고
+    # 여기에 (헤더명 보존한 채로) 모아서 저장한다.
     analysis_hash: Optional[str] = None        # 이 분석이 만들어진 시점의 readme_hash
 
 

@@ -2471,3 +2471,108 @@ body {
     max-height: 60vh;
     overflow-y: auto;
 }
+/* ---------------------------------------------------------------------
+   Typora 연동 + 개인저장소({사용자} 저장소) 관련 추가 CSS.
+   기존 App.css 맨 끝에 그대로 붙여넣으세요.
+--------------------------------------------------------------------- */
+
+.personal-repo-btn {
+  background-color: #7c3aed !important;
+}
+.personal-repo-btn:hover:not(:disabled) {
+  background-color: #6d28d9 !important;
+}
+
+/* ---------------------------------------------------------------------
+   관리자 패널 + GitHub 관심분야 선택 UI 추가 CSS.
+   기존 App.css 맨 끝에 그대로 붙여넣으세요.
+--------------------------------------------------------------------- */
+
+.admin-panel-btn {
+  background-color: #dc2626 !important;
+}
+.admin-panel-btn:hover:not(:disabled) {
+  background-color: #b91c1c !important;
+}
+
+.github-fields-picker {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.github-fields-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.github-fields-header button {
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.github-fields-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-bottom: 8px;
+  max-height: 90px;
+  overflow-y: auto;
+}
+
+.github-field-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.github-fields-custom-row {
+  display: flex;
+  gap: 8px;
+}
+
+.github-fields-custom-row input {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+/* ---------------------------------------------------------------------
+   GitHub 트렌딩 크롤링 진행 중 스피너. 기존 App.css 맨 끝에 붙여넣으세요.
+--------------------------------------------------------------------- */
+
+.github-trending-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: github-trending-spin 0.7s linear infinite;
+}
+
+@keyframes github-trending-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
