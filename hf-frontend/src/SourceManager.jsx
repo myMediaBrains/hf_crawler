@@ -185,7 +185,7 @@ export default function SourceManager() {
     };
 
     return (
-        <div className="source-manager-panel" style={{ border: 'none', margin: 0, padding: 0 }}>
+        <>
             <div className="scheduler-config-row">
                 <span title="이 값은 '몇 시에 시계를 볼지'이고, 아래 각 소스/키워드의 주기(시간)는 '실제로 얼마 만에 한 번씩 도는지'입니다. 스케줄러 점검 간격이 가장 짧은 주기보다 크면 그 항목은 정시에 안 돕니다.">
                     스케줄러 점검 간격 (ⓘ 소스/키워드별 주기보다 짧아야 함):
@@ -227,8 +227,7 @@ export default function SourceManager() {
                 <button onClick={handleAddSource}>+ 직접 추가</button>
             </div>
 
-            <div className="source-manager-list">
-                <div className="source-filter-bar">
+            <div className="source-filter-bar">
                     <button
                         className={`source-filter-chip ${!categoryFilter && !showFailingOnly ? 'active' : ''}`}
                         onClick={() => { setCategoryFilter(null); setShowFailingOnly(false); }}
@@ -271,25 +270,21 @@ export default function SourceManager() {
                     }
 
                     return (
-                        <div className="source-table-scroll">
+                        <div className="genre-editor-table-wrap">
                             <table className="source-table">
                                 <colgroup>
                                     <col style={{ width: '110px' }} />
                                     <col style={{ width: '22%' }} />
                                     <col style={{ width: '60px' }} />
-                                    <col style={{ width: '64px' }} />
                                     <col />
-                                    <col style={{ width: '70px' }} />
-                                    <col style={{ width: '56px' }} />
+                                    <col style={{ width: '90px' }} />
                                 </colgroup>
                                 <thead>
                                     <tr>
                                         <th>카테고리</th>
                                         <th>소스</th>
                                         <th>건수</th>
-                                        <th>구분</th>
-                                        <th>URL</th>
-                                        <th>주기</th>
+                                        <th>출처 URL</th>
                                         <th></th>
                                     </tr>
                                 </thead>
@@ -315,7 +310,7 @@ export default function SourceManager() {
                                                 <tr key={group.category} className="source-table-category-row-collapsed">
                                                     <td
                                                         className="source-table-category"
-                                                        colSpan={7}
+                                                        colSpan={5}
                                                         onClick={toggleCollapse}
                                                         style={{ cursor: 'pointer' }}
                                                     >
@@ -381,55 +376,39 @@ export default function SourceManager() {
                                                     </td>
                                                 )}
                                                 <td className="source-table-name">
-                                                    {src.name}
+                                                    {src.article_url ? (
+                                                        <a
+                                                            href={src.article_url}
+                                                            target="_blank"
+                                                            rel="noreferrer"
+                                                            title="해당자료 URL (가장 최근 수집된 기사 원문)"
+                                                        >
+                                                            {src.name}
+                                                        </a>
+                                                    ) : (
+                                                        src.name
+                                                    )}
                                                     {src.status === 'failing' && (
                                                         <span className="source-row-warning">
                                                             {' '}⚠️ 연속 {src.fail_count}회 실패
                                                         </span>
                                                     )}
+                                                    {src.source_type === 'blocked' && (
+                                                        <span
+                                                            className="source-table-block-reason"
+                                                            title="크롤링이 계속 막혀 기사를 저장하지 못한 사유"
+                                                        >
+                                                            {' '}🚫 {src.block_reason || '차단(원인불명)'}
+                                                        </span>
+                                                    )}
                                                 </td>
                                                 <td className="source-table-count-cell">
-                                                    {(sourceCounts[src.name] ?? 0)}건
-                                                </td>
-                                                <td>
-                                                    <span
-                                                        className={`source-origin-badge ${isAutoOrigin(src.origin) ? 'auto' : 'manual'}`}
-                                                    >
-                                                        {isAutoOrigin(src.origin) ? '자동' : '수동'}
-                                                    </span>
+                                                    {(sourceCounts[src.name] ?? 0)}
                                                 </td>
                                                 <td className="source-table-url" title={src.url}>
                                                     <a href={src.url} target="_blank" rel="noreferrer">
                                                         {src.url}
                                                     </a>
-                                                </td>
-                                                <td className="source-table-interval">
-                                                    {src.source_type === 'blocked' ? (
-                                                        <span
-                                                            className="source-table-block-reason"
-                                                            title="크롤링이 계속 막혀 기사를 저장하지 못한 사유"
-                                                        >
-                                                            🚫 {src.block_reason || '차단(원인불명)'}
-                                                        </span>
-                                                    ) : (
-                                                        <>
-                                                            <input
-                                                                type="number"
-                                                                min="0.5"
-                                                                step="0.5"
-                                                                defaultValue={src.interval_hours}
-                                                                style={{ width: '50px', textAlign: 'right' }}
-                                                                title={`다음 점검: ${formatNextCheck(src.last_attempt_at, src.interval_hours)}`}
-                                                                onBlur={(e) => {
-                                                                    const v = Number(e.target.value);
-                                                                    if (v > 0 && v !== src.interval_hours) {
-                                                                        handleUpdateSourceInterval(src.id, v);
-                                                                    }
-                                                                }}
-                                                            />
-                                                            <span style={{ marginLeft: '4px' }}>시간</span>
-                                                        </>
-                                                    )}
                                                 </td>
                                                 <td className="source-table-delete-cell">
                                                     {confirmDeleteId === src.id ? (
@@ -437,6 +416,7 @@ export default function SourceManager() {
                                                             <button
                                                                 onClick={() => handleDeleteSource(src.id)}
                                                                 className="source-delete-confirm-yes"
+                                                                title="관련 기사까지 함께 삭제되며 되돌릴 수 없습니다"
                                                             >
                                                                 확인
                                                             </button>
@@ -451,6 +431,7 @@ export default function SourceManager() {
                                                         <button
                                                             onClick={() => setConfirmDeleteId(src.id)}
                                                             className="source-row-delete"
+                                                            title="이 출처를 삭제하면 지금까지 수집된 관련 기사도 함께 삭제되며, 되돌릴 수 없습니다."
                                                         >
                                                             🗑️
                                                         </button>
@@ -464,7 +445,6 @@ export default function SourceManager() {
                         </div>
                     );
                 })()}
-            </div>
-        </div>
+        </>
     );
 }

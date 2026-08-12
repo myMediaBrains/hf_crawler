@@ -179,6 +179,10 @@ class KeywordIntervalSetRequest(BaseModel):
     months_back: int = 1
     interval_hours: float = 24.0
 
+class BulkIntervalUpdateRequest(BaseModel):
+    months_back: int = 1
+    interval_hours: float = 24.0
+
 
 class GenreCreateRequest(BaseModel):
     major_category: str
@@ -800,44 +804,47 @@ def get_current_user(user_id: str, session: Session = Depends(get_session)):
 # 개인화 프로필 API (기존 + user_id 연결)
 # ============================================
 
+# ============================================
+# 개인화 프로필 API (신규)
+# ============================================
+
 class ExplicitFeedbackRequest(BaseModel):
     article_id: int
     positive: bool  # True=👍, False=👎
-    user_id: str | None = None
 
 
 @app.post("/personalization/feedback")
 def submit_feedback(request: ExplicitFeedbackRequest, session: Session = Depends(get_session)):
     """
-    기사 카드에 👍/👎 버튼을 추가하고 여기로 연결한다.
-    프론트에서는 ArticleCard.jsx 하단에 버튼 두 개만 추가하면 됨.
+    기사 카드에 👍/👎 버튼을 추가하고 여기로 연결하세요.
+    프론트에서는 ArticleCard.jsx 하단에 버튼 두 개만 추가하면 됩니다.
     """
-    signal = store_explicit_feedback(
-        session, article_id=request.article_id, positive=request.positive, user_id=request.user_id
-    )
+    signal = store_explicit_feedback(session, article_id=request.article_id, positive=request.positive)
     if signal is None:
         raise HTTPException(status_code=404, detail="해당 기사를 찾을 수 없거나 분류할 수 없습니다.")
-    # 2026-08-09: InteractionSignal.subcategory(삭제됨) 대신 major_category/tag_id 반환
-    return {
-        "status": "success",
-        "tag_id": signal.tag_id,
-        "major_category": signal.major_category,
-        "weight": signal.weight,
-    }
+    return {"status": "success", "subcategory": signal.subcategory, "weight": signal.weight}
 
 
 @app.get("/personalization/profile")
-def get_personalization_profile(user_id: str | None = None, session: Session = Depends(get_session)):
-    """현재까지 쌓인 개인화 프로필 전체 (시간 가중 감쇠 적용된 상태). user_id 생략 시 전체 집계."""
-    return {"profile": get_profile(session, user_id=user_id)}
+def get_personalization_profile(session: Session = Depends(get_session)):
+    """
+    현재까지 쌓인 개인화 프로필 전체를 반환한다 (시간 가중 감쇠 적용된 상태).
+    설정 화면 등에 "당신의 관심사" 시각화로 바로 붙일 수 있는 형태.
+    """
+    return {"profile": get_profile(session)}
 
 
 @app.get("/personalization/top-interests")
-def get_personalization_top_interests(
-    n: int = Query(5), user_id: str | None = None, session: Session = Depends(get_session)
-):
-    """챗봇/보고서 생성 프롬프트에 주입할 상위 관심사. user_id 생략 시 전체 집계."""
-    top = get_top_interests(session, n=n, user_id=user_id)
+def get_personalization_top_interests(n: int = Query(5), session: Session = Depends(get_session)):
+    """
+    챗봇/보고서 생성 프롬프트에 주입할 상위 관심사.
+    사용 예 (증권 브리핑 프롬프트 조립 시):
+
+        top = get_top_interests(session, n=5)
+        interest_text = ", ".join(f"{s}({round(d['score'],2)})" for s, d in top)
+        system_prompt = f"사용자의 최근 관심 분야: {interest_text}. ..."
+    """
+    top = get_top_interests(session, n=n)
     return {"top_interests": [{"subcategory": s, **d} for s, d in top]}
 
 
@@ -1498,6 +1505,31 @@ def set_keyword_interval(request: KeywordIntervalSetRequest, session: Session = 
         )
     }
 
+@app.put("/keywords/interval/bulk")
+def update_all_keywords_interval(
+    request: BulkIntervalUpdateRequest,
+    session: Session = Depends(get_session),
+):
+    keywords = session.exec(select(Keyword)).all()
+
+    count = 0
+    for kw in keywords:
+        kw.months_back = request.months_back
+        kw.interval_hours = request.interval_hours
+        session.add(kw)
+        count += 1
+
+    session.commit()
+
+    return {
+        "status": "success",
+        "message": (
+            f"등록된 키워드 {count}개에 "
+            f"'최근 {request.months_back}개월 이내 / {request.interval_hours}시간마다'를 "
+            f"일괄 적용했습니다."
+        ),
+    }
+
 
 # 3-1-4. 키워드 삭제 - 등록 취소와 함께, 그 키워드로 수집된 기사도 전부 함께 삭제한다
 # (8/7 세션 후반 요청 반영 - 이전엔 기사를 남겼으나 이제는 완전 삭제로 변경).
@@ -1810,10 +1842,20 @@ def list_sources(session: Session = Depends(get_session)):
     result = []
     for s in sources:
         tag = _tag_for(s.tag_id)
+        # '해당자료 URL' - 이 소스에서 가장 최근에 수집된 기사의 실제 원문 URL.
+        # Source.url(=출처 URL)은 재수집에 쓰는 구글뉴스 검색/피드 URL이라
+        # 사람이 클릭해서 보기엔 안 맞음 - 실제 기사 링크는 Article.url에 이미
+        # 올바르게 저장돼 있다(collectors.py가 구글 리다이렉트를 미리 해제해둠).
+        latest_article = session.exec(
+            select(Article)
+            .where(Article.source == s.name)
+            .order_by(Article.collected_at.desc())
+        ).first()
         result.append({
             "id": s.id,
             "name": s.name,
             "url": s.url,
+            "article_url": latest_article.url if latest_article else None,
             "major_category": tag.major_category if tag else None,
             # 2026-08-09: category(문자열) 대신 tag_id로 조인한 major_category.
             "sensitive": tag.sensitive if tag else False,
@@ -1850,6 +1892,14 @@ def evaluate_sources(session: Session = Depends(get_session)):
         lengths = [len(a.content) for a in articles if a.content]
         avg_length = mean(lengths) if lengths else 0.0
 
+        # '해당자료 URL' - 이미 조회해둔 articles 중 가장 최근 것의 실제 URL.
+        # (list_sources와 같은 이유 - Source.url은 재수집용 검색 URL이라
+        # 클릭해서 보기엔 안 맞고, Article.url이 실제 기사 원문 링크다.)
+        latest_article = (
+            max(articles, key=lambda a: a.collected_at or datetime.min)
+            if articles else None
+        )
+
         score_result = source_scoring.compute_score(
             article_count=article_count,
             fail_count=s.fail_count,
@@ -1863,6 +1913,7 @@ def evaluate_sources(session: Session = Depends(get_session)):
             "id": s.id,
             "name": s.name,
             "url": s.url,
+            "article_url": latest_article.url if latest_article else None,
             "status": s.status,
             "article_count": article_count,
             "fail_count": s.fail_count,

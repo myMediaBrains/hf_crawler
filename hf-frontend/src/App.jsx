@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import { toast, Toaster } from 'react-hot-toast';
 import ArticleCard from './ArticleCard';
 import GenreEditor from "./GenreEditor";
+import GitHubRepos from "./GitHubRepos";
 import GenrePreferenceSelector from "./GenrePreferenceSelector";
 import CrawlToggleButton from "./CrawlToggleButton";
 import UserRegister from "./UserRegister";
@@ -98,7 +99,6 @@ function App() {
     // 전담하면서 잠깐 months_back을 뺐다가 다시 복원함 (8/7 세션 후반).
     const [monthsBack, setMonthsBack] = useState(1);
     const [intervalHours, setIntervalHours] = useState(24);
-    const [showIntervalPopover, setShowIntervalPopover] = useState(false);
 
     
 
@@ -616,37 +616,6 @@ function App() {
         handleCollectPipeline();
     };
 
-    // '검색주기설정' 버튼: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
-    // 저장해야 실제로 반영된다. 즉시 수집은 하지 않고, 키워드를 등록하거나(없으면)
-    // 이미 있으면 개월수/검색 주기만 갱신한다. 지금 당장 수집하고 싶으면
-    // '실시간 수집' 버튼을 쓰면 된다 - 두 버튼의 역할을 명확히 분리 (8/7 세션 후반).
-    // DB 쓰기 한 번뿐이라 오래 걸리지 않으므로 취소 로직은 두지 않았다.
-    const handleSetSearchInterval = async (e) => {
-        e.preventDefault();
-        if (!keyword.trim()) {
-            toast('검색어를 입력해주세요.');
-            return;
-        }
-
-        const toastId = toast.loading(`'${keyword}' 검색 주기 설정 중...`);
-        try {
-            const response = await axios.put(`${API_URL}/keywords/interval`, {
-                name: keyword.trim(),
-                months_back: monthsBack,
-                interval_hours: intervalHours,
-            });
-            toast.success(response.data.message, { id: toastId });
-            setShowIntervalPopover(false);
-            await fetchKeywordStats();
-            if (showKeywordManager) {
-                await fetchRegisteredKeywords();
-            }
-        } catch (err) {
-            console.error("검색 주기 설정 에러:", err);
-            toast.error('검색 주기 설정 중 오류가 발생했습니다.', { id: toastId });
-        }
-    };
-
     // 검색창에 이미 등록된 키워드 이름을 입력하고 포커스를 벗어나면, 그 키워드의
     // 기존 설정(최근 N개월/N시간 주기)을 불러와 입력창에 미리 채워준다.
     // "검색주기설정을 다시 눌러서 수정한다"는 게, 지금 어떤 값으로 돼있는지도
@@ -1006,45 +975,9 @@ function App() {
 
                 <GenrePreferenceSelector />
 
-                {/* 검색주기설정: 클릭하면 개월/시간 입력창(팝오버)이 나타나고, 그 안에서
-                    저장을 눌러야 실제로 반영된다 (8/7 세션 후반 - 상시 노출 대신 토글로 변경) */}
-                <div style={{ position: 'relative' }}>
-                    <button
-                        type="button"
-                        className="collect-btn"
-                        style={{ backgroundColor: showIntervalPopover ? '#6d28d9' : '#8b5cf6' }}
-                        onClick={() => setShowIntervalPopover(!showIntervalPopover)}
-                    >
-                        ⏱️ 검색주기설정
-                    </button>
-
-                    {showIntervalPopover && (
-                        <form onSubmit={handleSetSearchInterval} className="search-collect-options-popover">
-                            <label>
-                                최근
-                                <input
-                                    type="number"
-                                    min="1"
-                                    value={monthsBack}
-                                    onChange={(e) => setMonthsBack(Number(e.target.value))}
-                                />
-                                개월 이내 자료
-                            </label>
-                            <label>
-                                <input
-                                    type="number"
-                                    min="1"
-                                    value={intervalHours}
-                                    onChange={(e) => setIntervalHours(Number(e.target.value))}
-                                />
-                                시간마다 재수집
-                            </label>
-                            <button type="submit" className="search-btn">
-                                저장
-                            </button>
-                        </form>
-                    )}
-                </div>
+                {/* 2026-08-11: 검색주기설정 팝오버는 데이터편집 탭(IntervalSettings)으로
+                    이동했고, 이 자리엔 데이터편집 탭에서 빠져나온 GitHub 저장소가 들어왔다. */}
+                <GitHubRepos />
 
                 <GenreEditor />
             </div>

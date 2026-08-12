@@ -148,7 +148,7 @@ export default function SourceEvaluation({ embedded = false }) {
                         <tr>
                           <th>순위</th>
                           <th>장르</th>
-                          <th>출처</th>
+                          <th>해당자료</th>
                           <th>건수</th>
                           <th>스코어</th>
                           <th>상태</th>
@@ -160,7 +160,11 @@ export default function SourceEvaluation({ embedded = false }) {
                             <td>{s.overallRank}</td>
                             <td>{s.genre}</td>
                             <td>
-                              <a href={s.url} target="_blank" rel="noreferrer">{s.name}</a>
+                              {s.article_url ? (
+                                <a href={s.article_url} target="_blank" rel="noreferrer">{s.name}</a>
+                              ) : (
+                                s.name
+                              )}
                             </td>
                             <td>{s.article_count}</td>
                             <td><ScoreBar score={s.score} /></td>
@@ -176,7 +180,7 @@ export default function SourceEvaluation({ embedded = false }) {
                       <thead>
                         <tr>
                           <th>순위</th>
-                          <th>출처</th>
+                          <th>해당자료</th>
                           <th>건수</th>
                           <th>스코어</th>
                           <th>상태</th>
@@ -187,7 +191,11 @@ export default function SourceEvaluation({ embedded = false }) {
                           <tr key={s.id}>
                             <td>{s.rank}</td>
                             <td>
-                              <a href={s.url} target="_blank" rel="noreferrer">{s.name}</a>
+                              {s.article_url ? (
+                                <a href={s.article_url} target="_blank" rel="noreferrer">{s.name}</a>
+                              ) : (
+                                s.name
+                              )}
                             </td>
                             <td>{s.article_count}</td>
                             <td><ScoreBar score={s.score} /></td>

@@ -6,18 +6,26 @@
 //
 // 2026-08-10: 테이블 행에서 대분류/중분류/소분류를 직접 인라인으로 수정할 수
 // 있는 기능 추가. PATCH /genres/{keyword_id}를 호출한다.
+//
+// 2026-08-11: 출처관리/출처평가/GitHub 저장소 탭을 감싸던 바깥쪽
+// genre-editor-table-wrap을 제거했다. 각 컴포넌트(SourceManager,
+// SourceEvaluation, GitHubRepos)가 이제 자기 내부에서 "고정 영역 + 스크롤
+// 영역"을 직접 구분하므로, 여기서 한 번 더 감싸면 스크롤이 이중으로 걸려
+// 탭마다 동작이 달라지는 문제가 있었다. 장르목록 탭과 완전히 동일한 원칙:
+// 이 컴포넌트들을 .genre-editor-panel(flex column)의 직속 자식으로 그대로
+// 둔다.
 // ---------------------------------------------------------------------------
 
 import { useState } from "react";
 import axios from "axios";
 import SourceManager from "./SourceManager";
 import SourceEvaluation from "./SourceEvaluation";
-import GitHubRepos from "./GitHubRepos";
+import IntervalSettings from "./IntervalSettings";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 export default function GenreEditor() {
-  const [activeTab, setActiveTab] = useState("genres"); // "genres" | "sources" | "evaluation" | "github"
+  const [activeTab, setActiveTab] = useState("genres"); // "genres" | "sources" | "evaluation" | "interval"
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -122,14 +130,14 @@ export default function GenreEditor() {
   return (
     <>
       <button onClick={handleOpen} className="collect-btn genre-editor-btn">
-        🗂️ 장르 편집기
+        🗂️ 데이터 편집
       </button>
 
       {open && (
         <div className="genre-editor-overlay" onClick={() => setOpen(false)}>
           <div className="genre-editor-panel" onClick={(e) => e.stopPropagation()}>
             <div className="genre-editor-header">
-              <h3>장르 편집기</h3>
+              <h3>데이터 편집</h3>
               <button onClick={() => setOpen(false)}>닫기</button>
             </div>
 
@@ -153,19 +161,19 @@ export default function GenreEditor() {
                 📊 출처 평가
               </button>
               <button
-                className={`genre-editor-tab ${activeTab === "github" ? "active" : ""}`}
-                onClick={() => setActiveTab("github")}
+                className={`genre-editor-tab ${activeTab === "interval" ? "active" : ""}`}
+                onClick={() => setActiveTab("interval")}
               >
-                🐙 GitHub 저장소
+                ⏱️ 검색주기설정
               </button>
             </div>
 
             {activeTab === "sources" ? (
-              <div className="genre-editor-table-wrap"><SourceManager /></div>
+              <SourceManager />
             ) : activeTab === "evaluation" ? (
-              <div className="genre-editor-table-wrap"><SourceEvaluation embedded /></div>
-            ) : activeTab === "github" ? (
-              <div className="genre-editor-table-wrap"><GitHubRepos /></div>
+              <SourceEvaluation embedded />
+            ) : activeTab === "interval" ? (
+              <IntervalSettings onSaved={() => setActiveTab("genres")} />
             ) : (
               <>
 

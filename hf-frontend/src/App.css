@@ -1352,6 +1352,7 @@ body {
 /* ── 소스 관리 테이블 (카테고리별 그룹핑) ── */
 .source-table {
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 0.85rem;
 }
@@ -1415,7 +1416,8 @@ body {
 }
 
 .source-table-url {
-    max-width: 220px;
+    max-width: 0; /* table-layout:fixed 하의 colgroup 남는 폭을 그대로 씀 - 이 값 자체는
+                     overflow:hidden 트리거용이고 실제 폭 제한은 colgroup이 담당 */
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1485,6 +1487,7 @@ body {
 /* ── 삭제 인라인 확인/취소 ── */
 .source-table-delete-cell {
     white-space: nowrap;
+    text-align: right;
 }
 
 .source-delete-confirm {
@@ -1519,15 +1522,6 @@ body {
 }
 
 /* ── 소스 테이블 스크롤 컨테이너 ── */
-.source-table-scroll {
-    min-height: 900px;
-    max-height: 1100px;
-    overflow-y: auto;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    overscroll-behavior: contain;
-}
-
 /* 컬럼 헤더(소스/구분/URL/주기)는 스크롤해도 항상 맨 위에 고정 */
 .source-table thead th {
     position: sticky;
@@ -2127,11 +2121,15 @@ body {
   font-weight: 600;
 }
 
-/* 표 영역만 내부 스크롤 - 헤더/평가기준/장르버튼은 항상 고정 노출 */
+/* 표 영역만 내부 스크롤 - 헤더/평가기준/장르버튼은 항상 고정 노출.
+   2026-08-11: 장르편집기 안에서 더 이상 별도 wrap div로 다시 감싸지 않고
+   .genre-editor-panel의 flex 자식으로 직접 들어가므로, genre-editor-table-wrap과
+   동일하게 max-height 안전장치를 둔다 (순수 flex:1만으로는 불안정했던 전례가 있어서). */
 .source-eval-table-wrap {
   overflow-y: auto;
   flex: 1;
   min-height: 0;
+  max-height: calc(86vh - 220px);
   overscroll-behavior: contain;
 }
 
@@ -2183,6 +2181,13 @@ body {
 }
 .genre-editor-btn:hover:not(:disabled) {
   background-color: #047857 !important;
+}
+
+.github-repos-btn {
+  background-color: #24292e !important;
+}
+.github-repos-btn:hover:not(:disabled) {
+  background-color: #1b1f23 !important;
 }
 
 .genre-editor-overlay {
