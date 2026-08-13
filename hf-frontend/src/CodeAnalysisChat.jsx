@@ -27,6 +27,9 @@ function CodeAnalysisChat() {
     const [commitMessage, setCommitMessage] = useState('');
     const [commitBusy, setCommitBusy] = useState(false);
     const [commitResult, setCommitResult] = useState(null);
+    const [undoConfirm, setUndoConfirm] = useState(null);
+    const [undoBusy, setUndoBusy] = useState(false);
+    const [undoResult, setUndoResult] = useState(null);
     const bottomRef = useRef(null);
 
     const refreshHistory = (sid) => {
@@ -215,11 +218,12 @@ function CodeAnalysisChat() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ message_id: messageId }),
             });
-            if (!res.ok) {
-                const detail = await res.json().catch(() => ({}));
-                throw new Error(detail.detail || '적용 실패');
-            }
-            setMessages(prev => prev.map(m => m.id === messageId ? { ...m, applied: true } : m));
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || '적용 실패');
+            const anyApplied = (data.results || []).some(r => r.status === 'applied');
+            setMessages(prev => prev.map(m => m.id === messageId
+                ? { ...m, applied: anyApplied, apply_results: data.results }
+                : m));
         } catch (err) {
             alert(`제안 적용 실패: ${err.message}`);
         } finally {
@@ -239,13 +243,63 @@ function CodeAnalysisChat() {
             });
             const data = await res.json();
             setCommitResult(data);
-            if (data.status === 'success') setCommitMessage('');
+            if (data.status === 'success') {
+                setCommitMessage('');
+                // 2026-08-13: 푸시 성공 시, 로컬 git 결과만 믿지 않고 실제로
+                // GitHub 원격에 반영됐는지 최신 커밋을 다시 조회해서 확인한다.
+                try {
+                    const myRepoRes = await fetch(`${API_URL}/github/my-repo`);
+                    const myRepo = await myRepoRes.json();
+                    if (myRepoRes.ok) {
+                        const branch = myRepo.local_branch || myRepo.default_branch;
+                        const commitsRes = await fetch(
+                            `${API_URL}/github/commits?owner=${myRepo.owner}&repo=${myRepo.repo}&branch=${branch}&limit=1`
+                        );
+                        const commitsData = await commitsRes.json();
+                        if (commitsRes.ok && commitsData.commits?.[0]) {
+                            setCommitResult(prev => ({ ...prev, githubCheck: commitsData.commits[0] }));
+                        }
+                    }
+                } catch { /* 확인 실패해도 커밋/푸시 자체는 성공했으니 조용히 무시 */ }
+            }
         } catch (err) {
             setCommitResult({ status: 'error', steps: [{ cmd: '(연결)', stderr: err.message }] });
         } finally {
             setCommitBusy(false);
         }
     };
+
+    const requestUndoConfirm = async () => {
+        setUndoResult(null);
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/git/last-commit`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || '마지막 커밋 정보를 가져오지 못했습니다.');
+            setUndoConfirm(data);
+        } catch (err) {
+            alert(`되돌리기 확인 실패: ${err.message}`);
+        }
+    };
+
+    const confirmUndo = async () => {
+        setUndoBusy(true);
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/git/undo`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ push: true }),
+            });
+            const data = await res.json();
+            setUndoResult(data);
+            if (data.status === 'success') setUndoConfirm(null);
+        } catch (err) {
+            setUndoResult({ status: 'error', steps: [{ cmd: '(연결)', stderr: err.message }] });
+        } finally {
+            setUndoBusy(false);
+        }
+    };
+
+    const cancelUndo = () => setUndoConfirm(null);
 
     const visibleFiles = fileFilter.trim()
         ? fileTree.filter(f => f.toLowerCase().includes(fileFilter.trim().toLowerCase()))
@@ -358,24 +412,51 @@ function CodeAnalysisChat() {
                                                 {m.source === 'watcher' && <span className="code-msg-watcher-badge">🔍 자동 리뷰</span>}
                                             </div>
                                             <pre>{m.content || (streaming && i === messages.length - 1 ? '생각 중...' : '')}</pre>
-                                            {m.proposed_path && (
+                                            {m.proposed_edits && m.proposed_edits.length > 0 && (
                                                 <div className="code-proposal-box">
                                                     <div className="code-proposal-header">
-                                                        📝 수정 제안: {m.proposed_path}
+                                                        📝 수정 제안 ({m.proposed_edits.length}개 파일/블록)
                                                     </div>
-                                                    <details>
-                                                        <summary>제안된 전체 내용 보기</summary>
-                                                        <pre className="code-proposal-content">{m.proposed_content}</pre>
-                                                    </details>
-                                                    {m.applied ? (
-                                                        <span className="code-proposal-applied">✅ 적용됨</span>
-                                                    ) : (
+                                                    {m.proposed_edits.map((edit, ei) => {
+                                                        const result = m.apply_results?.find(r => r.path === edit.path && r.search === edit.search);
+                                                        return (
+                                                            <div key={ei} className="code-edit-block">
+                                                                <div className="code-edit-path">{edit.path}</div>
+                                                                <details>
+                                                                    <summary>변경 내용 보기</summary>
+                                                                    <div className="code-edit-diff">
+                                                                        <pre className="code-edit-search">- {edit.search}</pre>
+                                                                        <pre className="code-edit-replace">+ {edit.replace}</pre>
+                                                                    </div>
+                                                                </details>
+                                                                {result && (
+                                                                    <div className={result.status === 'applied' ? 'code-edit-result ok' : 'code-edit-result error'}>
+                                                                        {result.status === 'applied' ? '✅ 적용됨' : `⚠️ ${result.detail}`}
+                                                                    </div>
+                                                                )}
+                                                                {result?.lint?.available && !result.lint.ok && (
+                                                                    <details className="code-lint-box">
+                                                                        <summary>
+                                                                            🔎 {result.lint.tool} 검사에서 {result.lint.issues?.length || 0}개 이슈 발견
+                                                                        </summary>
+                                                                        <pre className="code-lint-issues">
+                                                                            {(result.lint.issues || []).join('\n')}
+                                                                        </pre>
+                                                                    </details>
+                                                                )}
+                                                                {result?.lint?.available && result.lint.ok && (
+                                                                    <div className="code-lint-ok">✅ {result.lint.tool} 통과</div>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                    {!m.applied && (
                                                         <button
                                                             className="code-proposal-apply-btn"
                                                             onClick={() => applyProposal(m.id)}
                                                             disabled={applyingId === m.id}
                                                         >
-                                                            {applyingId === m.id ? '적용 중...' : '이 제안 적용하기'}
+                                                            {applyingId === m.id ? '적용 중...' : '이 제안 전체 적용하기'}
                                                         </button>
                                                     )}
                                                 </div>
@@ -422,10 +503,53 @@ function CodeAnalysisChat() {
                                     >
                                         {commitBusy ? '커밋 중...' : '📤 커밋 & 푸시'}
                                     </button>
+                                    <button
+                                        className="code-undo-btn"
+                                        onClick={requestUndoConfirm}
+                                        disabled={undoBusy || !!undoConfirm}
+                                        title="마지막 커밋을 revert로 되돌립니다 (히스토리를 지우지 않고 반대 커밋을 추가)"
+                                    >
+                                        ↩️ 되돌리기
+                                    </button>
                                 </div>
+
+                                {undoConfirm && (
+                                    <div className="code-undo-confirm">
+                                        마지막 커밋을 되돌릴까요?{' '}
+                                        <span className="github-commit-sha">{undoConfirm.sha}</span> {undoConfirm.message}
+                                        <div className="code-undo-confirm-actions">
+                                            <button onClick={confirmUndo} disabled={undoBusy} className="code-undo-confirm-yes">
+                                                {undoBusy ? '되돌리는 중...' : '되돌리기 (revert + push)'}
+                                            </button>
+                                            <button onClick={cancelUndo} disabled={undoBusy} className="code-undo-confirm-no">취소</button>
+                                        </div>
+                                    </div>
+                                )}
+                                {undoResult && (
+                                    <div className={undoResult.status === 'success' ? 'code-commit-result ok' : 'code-commit-result error'}>
+                                        {undoResult.status === 'success' ? '✅ 되돌리기 완료 (푸시됨)' : '⚠️ 되돌리기 실패'}
+                                        <details>
+                                            <summary>상세 로그</summary>
+                                            <pre>{(undoResult.steps || []).map(s => `$ git ${s.cmd}\n${s.stdout || ''}${s.stderr || ''}`).join('\n\n')}</pre>
+                                        </details>
+                                    </div>
+                                )}
+
                                 {commitResult && (
                                     <div className={commitResult.status === 'success' ? 'code-commit-result ok' : 'code-commit-result error'}>
                                         {commitResult.status === 'success' ? '✅ 커밋/푸시 완료' : '⚠️ 실패'}
+                                        {commitResult.githubCheck && (
+                                            <div className="github-verify-row">
+                                                🐙 GitHub 확인됨: <span className="github-commit-sha">{commitResult.githubCheck.sha}</span>{' '}
+                                                {commitResult.githubCheck.message}{' '}
+                                                <a href={commitResult.githubCheck.html_url} target="_blank" rel="noreferrer">보기</a>
+                                            </div>
+                                        )}
+                                        {commitResult.status === 'success' && !commitResult.githubCheck && (
+                                            <div className="github-verify-row github-verify-pending">
+                                                🐙 GitHub 반영 확인 중...
+                                            </div>
+                                        )}
                                         <details>
                                             <summary>상세 로그</summary>
                                             <pre>{(commitResult.steps || []).map(s => `$ git ${s.cmd}\n${s.stdout || ''}${s.stderr || ''}`).join('\n\n')}</pre>

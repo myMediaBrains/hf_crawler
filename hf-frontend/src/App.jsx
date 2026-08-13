@@ -12,6 +12,7 @@ import CrawlToggleButton from "./CrawlToggleButton";
 import UserRegister from "./UserRegister";
 import ChatWindow from "./ChatWindow";
 import CodeAnalysisChat from "./CodeAnalysisChat";
+import GitHubBrowser from "./GitHubBrowser";
 import './App.css';
 
 
@@ -1038,6 +1039,11 @@ function App() {
                 {/* 2026-08-13: 코딩분석 - VS Code로 편집 중인 이 프로젝트를
                     qwen2.5-coder:32b에게 참고시켜 대화하는 기능 */}
                 <CodeAnalysisChat />
+
+                {/* 2026-08-13: hf_coder의 GitHub 브라우징 - 타 저장소 탐색 + 내
+                    저장소(push 반영) 확인. 위의 <GitHubRepos />(hf_crawler의
+                    트렌딩 저장소 수집 기능)와는 완전히 다른 별개 기능. */}
+                <GitHubBrowser />
             </div>
 
             {message && (
