@@ -2495,6 +2495,471 @@ body {
   background-color: #b91c1c !important;
 }
 
+/* ---------------------------------------------------------------------
+   code-analysis-*.css
+   2026-08-13: "💻 코딩분석" 버튼 + 웹 클로드 방식 채팅 모달.
+   기존 genre-editor-*/github-repos-* 패턴(오버레이+패널, 다크테마 CSS 변수)을
+   그대로 재사용한다. 기존 App.css 맨 끝에 그대로 붙여넣으세요.
+--------------------------------------------------------------------- */
+
+.code-analysis-btn {
+  background-color: #0891b2 !important;
+}
+.code-analysis-btn:hover:not(:disabled) {
+  background-color: #0e7490 !important;
+}
+
+.code-analysis-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.code-analysis-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  width: min(1100px, 96vw);
+  height: min(760px, 90vh);
+  display: flex;
+  flex-direction: column;
+  padding: 20px 24px;
+  box-shadow: var(--shadow-lg);
+}
+
+.code-analysis-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  flex-shrink: 0;
+}
+
+.code-analysis-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.code-analysis-model-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(8, 145, 178, 0.15);
+  color: #22d3ee;
+  border: 1px solid rgba(8, 145, 178, 0.4);
+}
+
+.code-analysis-header button {
+  padding: 5px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.code-analysis-header button:hover {
+  border-color: var(--border-hover);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.code-analysis-status-row {
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.code-llm-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.code-llm-status-active {
+  color: #34d399;
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.code-llm-status-idle-loaded {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.06);
+}
+
+.code-llm-status-unloaded {
+  color: var(--text-secondary);
+}
+
+.code-analysis-body {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 왼쪽: 파일트리 사이드바 - 웹 클로드 Projects의 파일 선택과 동일한 UX */
+.code-analysis-sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-color);
+  padding-right: 14px;
+  min-height: 0;
+}
+
+.code-analysis-sidebar-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.code-analysis-file-filter {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.code-analysis-file-filter:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.code-file-tree {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.code-file-tree-empty {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  padding: 10px 2px;
+  line-height: 1.6;
+}
+
+.code-file-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 2px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  cursor: pointer;
+  word-break: break-all;
+  border-radius: 4px;
+}
+
+.code-file-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.code-file-item input {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+/* 오른쪽: 채팅 영역 */
+.code-analysis-chat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.code-analysis-messages {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.code-analysis-empty-hint {
+  color: var(--text-secondary);
+  font-size: 13.5px;
+  line-height: 1.8;
+  margin: auto;
+  text-align: center;
+}
+
+.code-msg {
+  max-width: 90%;
+}
+
+.code-msg-user {
+  align-self: flex-end;
+  text-align: right;
+}
+
+.code-msg-assistant {
+  align-self: flex-start;
+}
+
+.code-msg-role {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 3px;
+}
+
+.code-msg pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.code-msg-user pre {
+  background: var(--primary-color);
+  color: white;
+  display: inline-block;
+  text-align: left;
+}
+
+.code-msg-assistant pre {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.code-analysis-input {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-shrink: 0;
+}
+
+.code-analysis-input textarea {
+  flex: 1;
+  resize: none;
+  min-height: 44px;
+  max-height: 140px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13.5px;
+  font-family: inherit;
+}
+
+.code-analysis-input textarea:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.code-analysis-send-btn {
+  background-color: #0891b2 !important;
+  align-self: flex-end;
+}
+.code-analysis-send-btn:hover:not(:disabled) {
+  background-color: #0e7490 !important;
+}
+
+/* ---------------------------------------------------------------------
+   VS Code 연동 루프 (신규, 2026-08-13)
+   저장감지 토글, 자동리뷰 배지, 제안(patch) 박스, 커밋&푸시 영역.
+--------------------------------------------------------------------- */
+
+.code-watcher-toggle {
+  background: var(--bg-input);
+  color: var(--text-secondary);
+}
+.code-watcher-toggle.code-watcher-on {
+  background: rgba(239, 68, 68, 0.15) !important;
+  color: #f87171 !important;
+  border-color: rgba(239, 68, 68, 0.4) !important;
+}
+
+.code-msg-watcher-badge {
+  margin-left: 8px;
+  font-size: 10.5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.15);
+  color: #a78bfa;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+}
+
+.code-proposal-box {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: var(--radius-md);
+  background: rgba(139, 92, 246, 0.06);
+  font-size: 12.5px;
+}
+
+.code-proposal-header {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.code-proposal-box details summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.code-proposal-content {
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+}
+
+.code-proposal-apply-btn {
+  margin-top: 6px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: #7c3aed;
+  color: white;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.code-proposal-apply-btn:hover:not(:disabled) {
+  background: #6d28d9;
+}
+.code-proposal-apply-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.code-proposal-applied {
+  display: inline-block;
+  margin-top: 6px;
+  color: #34d399;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.code-commit-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+
+.code-commit-input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.code-commit-input:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.code-commit-btn {
+  padding: 8px 14px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: #059669;
+  color: white;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.code-commit-btn:hover:not(:disabled) {
+  background: #047857;
+}
+.code-commit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.code-commit-result {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+.code-commit-result.ok {
+  background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  color: #34d399;
+}
+.code-commit-result.error {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+}
+.code-commit-result summary {
+  cursor: pointer;
+  margin-top: 4px;
+}
+.code-commit-result pre {
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11.5px;
+  background: var(--bg-input);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  margin-top: 4px;
+}
+
+@media (max-width: 720px) {
+  .code-analysis-body {
+    flex-direction: column;
+  }
+  .code-analysis-sidebar {
+    width: 100%;
+    max-height: 160px;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+    padding-right: 0;
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+  }
+}
+
 .github-fields-picker {
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);

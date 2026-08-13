@@ -63,6 +63,8 @@ def _mark_end():
 class ModelTier(str, Enum):
     LIGHT = "light"   # 번역, 분류, 짧은 응답 - 상시 상주
     HEAVY = "heavy"    # RAG 보고서/학습서 생성 - 온디맨드 로드
+    # 2026-08-13: CODE 티어는 hf_coder(별도 서비스, :8100)로 이사됨.
+    # 코딩분석 관련 모델 라우팅은 이제 hf_coder/model_router.py에서 독립 관리.
 
 
 # 티어별 실제 Ollama 모델 태그 (ollama list 기준으로 확정된 이름만 사용)
@@ -259,6 +261,7 @@ TASK_PROFILES: dict[str, dict] = {
             "presence_penalty": 0.3,
         },
     },
+    # 2026-08-13: code_analysis 프로필은 hf_coder(별도 서비스)로 이사됨.
 }
 
 

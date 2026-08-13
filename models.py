@@ -579,3 +579,6 @@ class GitHubRepoTag(SQLModel, table=True):
     repo_id: int = Field(foreign_key="github_repos.id", index=True)
     tag_id: int = Field(foreign_key="tags.id", index=True)
     score: float = Field(default=1.0)
+
+
+# 2026-08-13: CodeChatMessage 테이블은 hf_coder(별도 서비스)의 자체 DB로 이사됨.

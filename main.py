@@ -25,7 +25,7 @@ from collectors import COLLECTOR_REGISTRY
 from datetime import datetime
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from dotenv import load_dotenv
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -320,6 +320,10 @@ os.makedirs(TYPORA_EDIT_DIR, exist_ok=True)
 # 중간 매개체"라서, Typora로 열고 저장한 뒤 '가져오기'를 누르면 이 파일을
 # 다시 읽어 DB를 갱신한다. Vault 폴더 안이지만 '.typora-edit'로 숨김
 # 처리해서 개인저장소 파일 목록(/vault/files)에는 안 잡히게 한다.
+
+# 2026-08-13 → 이후 hf_coder(별도 서비스, :8100)로 이사됨.
+# 코딩분석(💻) 관련 CODE_PROJECT_ROOT/파일트리/엔드포인트는 이제 hf_coder에 있음.
+# 자세한 내용은 hf_coder/README.md 참고.
 
 
 def _user_vault_root(user_id: str) -> str:
@@ -3417,3 +3421,7 @@ def resume_scheduler():
 @app.get("/scheduler/status")
 def get_scheduler_pause_status():
     return {"paused": job_control.is_paused()}
+
+
+# 2026-08-13 → 이후 hf_coder(별도 서비스, :8100)로 이사됨.
+# 코딩분석 채팅 API(/codeanalysis/*)는 이제 hf_coder에 있음. hf_coder/README.md 참고.

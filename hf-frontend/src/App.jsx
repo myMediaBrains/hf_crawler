@@ -11,6 +11,7 @@ import GenrePreferenceSelector from "./GenrePreferenceSelector";
 import CrawlToggleButton from "./CrawlToggleButton";
 import UserRegister from "./UserRegister";
 import ChatWindow from "./ChatWindow";
+import CodeAnalysisChat from "./CodeAnalysisChat";
 import './App.css';
 
 
@@ -1033,6 +1034,10 @@ function App() {
                 {currentUserId === 'Admin' && <GenreEditor />}
 
                 <PersonalRepository />
+
+                {/* 2026-08-13: 코딩분석 - VS Code로 편집 중인 이 프로젝트를
+                    qwen2.5-coder:32b에게 참고시켜 대화하는 기능 */}
+                <CodeAnalysisChat />
             </div>
 
             {message && (
