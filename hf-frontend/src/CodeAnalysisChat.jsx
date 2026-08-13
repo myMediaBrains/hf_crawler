@@ -22,11 +22,22 @@ function CodeAnalysisChat() {
     const [loadingTree, setLoadingTree] = useState(false);
     const [llmStatus, setLlmStatus] = useState(null);
     const [watching, setWatching] = useState(false);
+    const [vectorAvailable, setVectorAvailable] = useState(false);
+    const [vectorIndexBusy, setVectorIndexBusy] = useState(false);
+    const [vectorIndexResult, setVectorIndexResult] = useState(null);
+    const [architectMode, setArchitectMode] = useState(false);
+    const [agentMode, setAgentMode] = useState(false);
+    const [fastMode, setFastMode] = useState(false);
     const [watcherBusy, setWatcherBusy] = useState(false);
     const [applyingId, setApplyingId] = useState(null);
     const [commitMessage, setCommitMessage] = useState('');
     const [commitBusy, setCommitBusy] = useState(false);
     const [commitResult, setCommitResult] = useState(null);
+    const [undoConfirm, setUndoConfirm] = useState(null);
+    const [undoBusy, setUndoBusy] = useState(false);
+    const [undoResult, setUndoResult] = useState(null);
+    const [gitStatus, setGitStatus] = useState(null); // null=아직 안 불러옴, []=변경사항 없음, [...]=변경된 파일들
+    const [checkedGitPaths, setCheckedGitPaths] = useState(new Set());
     const bottomRef = useRef(null);
 
     const refreshHistory = (sid) => {
@@ -35,6 +46,24 @@ function CodeAnalysisChat() {
             .then(r => r.json())
             .then(data => setMessages(Array.isArray(data) ? data : []))
             .catch(() => {});
+    };
+
+    // 2026-08-13: 파일트리 새로고침 - 모달 열 때뿐 아니라 되돌리기/커밋 이후에도
+    // 호출한다. git 작업으로 파일이 삭제/생성될 수 있는데, 그때마다 사이드바가
+    // 저절로 갱신 안 되면 실제로는 지워진 파일이 체크된 채로 화면에 남아있는
+    // 것처럼 보이는 문제가 있었다 - 사라진 파일은 선택 목록에서도 같이 뺀다.
+    const refreshFileTree = () => {
+        setLoadingTree(true);
+        fetch(`${API_URL}/codeanalysis/files`)
+            .then(r => r.json())
+            .then(data => {
+                const files = data.files || [];
+                setFileTree(files);
+                const stillExists = new Set(files);
+                setIncludedFiles(prev => prev.filter(p => stillExists.has(p)));
+            })
+            .catch(() => setFileTree([]))
+            .finally(() => setLoadingTree(false));
     };
 
     // 모달을 열 때마다: 세션 확보(새로고침해도 이어지도록 localStorage에 저장),
@@ -49,12 +78,7 @@ function CodeAnalysisChat() {
         }
         setSessionId(sid);
 
-        setLoadingTree(true);
-        fetch(`${API_URL}/codeanalysis/files`)
-            .then(r => r.json())
-            .then(data => setFileTree(data.files || []))
-            .catch(() => setFileTree([]))
-            .finally(() => setLoadingTree(false));
+        refreshFileTree();
 
         fetch(`${API_URL}/codeanalysis/history/${sid}`)
             .then(r => r.json())
@@ -65,6 +89,13 @@ function CodeAnalysisChat() {
             .then(r => r.json())
             .then(data => setWatching(!!data.watching))
             .catch(() => {});
+
+        loadGitStatus();
+
+        fetch(`${API_URL}/codeanalysis/vector-status`)
+            .then(r => r.json())
+            .then(data => setVectorAvailable(!!data.available))
+            .catch(() => setVectorAvailable(false));
     }, [open]);
 
     // 2026-08-13: VS Code에서 저장한 변경사항이 감시기를 통해 자동으로 채팅에
@@ -124,15 +155,22 @@ function CodeAnalysisChat() {
         setStreaming(true);
 
         try {
-            const res = await fetch(`${API_URL}/codeanalysis/chat/stream`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+            const endpoint = agentMode ? '/codeanalysis/agent/stream' : '/codeanalysis/chat/stream';
+            const body = agentMode
+                ? { session_id: sessionId, message: userText, user_id: userId, fast_mode: fastMode }
+                : {
                     session_id: sessionId,
                     message: userText,
                     included_files: includedFiles,
                     user_id: userId,
-                }),
+                    architect: architectMode,
+                    fast_mode: fastMode,
+                };
+
+            const res = await fetch(`${API_URL}${endpoint}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
             });
 
             const reader = res.body.getReader();
@@ -215,11 +253,12 @@ function CodeAnalysisChat() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ message_id: messageId }),
             });
-            if (!res.ok) {
-                const detail = await res.json().catch(() => ({}));
-                throw new Error(detail.detail || '적용 실패');
-            }
-            setMessages(prev => prev.map(m => m.id === messageId ? { ...m, applied: true } : m));
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || '적용 실패');
+            const anyApplied = (data.results || []).some(r => r.status === 'applied');
+            setMessages(prev => prev.map(m => m.id === messageId
+                ? { ...m, applied: anyApplied, apply_results: data.results }
+                : m));
         } catch (err) {
             alert(`제안 적용 실패: ${err.message}`);
         } finally {
@@ -227,25 +266,128 @@ function CodeAnalysisChat() {
         }
     };
 
+    const loadGitStatus = async () => {
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/git/status`);
+            const data = await res.json();
+            if (res.ok) {
+                setGitStatus(data.files || []);
+                // 2026-08-13(개정): 기본을 "전부 체크"에서 "전부 해제"로 변경.
+                // "전부 체크"가 기본이었을 때, 무관한 파일(hf-frontend 소스 등)이
+                // test.py 같은 의도한 파일과 함께 커밋되는 사고가 실제로 반복됐다 -
+                // 매번 사람이 직접 골라야만 커밋되게 해서 원천 차단한다.
+                setCheckedGitPaths(new Set());
+            }
+        } catch { /* 조용히 무시 - 커밋 버튼 누를 때 다시 시도됨 */ }
+    };
+
+    const refreshVectorIndex = async () => {
+        setVectorIndexBusy(true);
+        setVectorIndexResult(null);
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/vector-index`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ force: false }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || '인덱스 빌드 실패');
+            setVectorIndexResult(data);
+        } catch (err) {
+            setVectorIndexResult({ error: err.message });
+        } finally {
+            setVectorIndexBusy(false);
+        }
+    };
+
+    const toggleGitFile = (path) => {
+        setCheckedGitPaths(prev => {
+            const next = new Set(prev);
+            if (next.has(path)) next.delete(path); else next.add(path);
+            return next;
+        });
+    };
+
     const commitAndPush = async () => {
         if (!commitMessage.trim() || commitBusy) return;
+        if (gitStatus && gitStatus.length > 0 && checkedGitPaths.size === 0) {
+            alert('커밋할 파일을 하나 이상 선택해주세요.');
+            return;
+        }
         setCommitBusy(true);
         setCommitResult(null);
         try {
+            const paths = (gitStatus && gitStatus.length > 0) ? Array.from(checkedGitPaths) : undefined;
             const res = await fetch(`${API_URL}/codeanalysis/git/commit-push`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: commitMessage, push: true }),
+                body: JSON.stringify({ message: commitMessage, push: true, ...(paths ? { paths } : {}) }),
             });
             const data = await res.json();
             setCommitResult(data);
-            if (data.status === 'success') setCommitMessage('');
+            if (data.status === 'success') {
+                setCommitMessage('');
+                loadGitStatus(); // 커밋 후 남은 변경사항만 다시 보이게 갱신
+                refreshFileTree();
+                // 2026-08-13: 푸시 성공 시, 로컬 git 결과만 믿지 않고 실제로
+                // GitHub 원격에 반영됐는지 최신 커밋을 다시 조회해서 확인한다.
+                try {
+                    const myRepoRes = await fetch(`${API_URL}/github/my-repo`);
+                    const myRepo = await myRepoRes.json();
+                    if (myRepoRes.ok) {
+                        const branch = myRepo.local_branch || myRepo.default_branch;
+                        const commitsRes = await fetch(
+                            `${API_URL}/github/commits?owner=${myRepo.owner}&repo=${myRepo.repo}&branch=${branch}&limit=1`
+                        );
+                        const commitsData = await commitsRes.json();
+                        if (commitsRes.ok && commitsData.commits?.[0]) {
+                            setCommitResult(prev => ({ ...prev, githubCheck: commitsData.commits[0] }));
+                        }
+                    }
+                } catch { /* 확인 실패해도 커밋/푸시 자체는 성공했으니 조용히 무시 */ }
+            }
         } catch (err) {
             setCommitResult({ status: 'error', steps: [{ cmd: '(연결)', stderr: err.message }] });
         } finally {
             setCommitBusy(false);
         }
     };
+
+    const requestUndoConfirm = async () => {
+        setUndoResult(null);
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/git/last-commit`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || '마지막 커밋 정보를 가져오지 못했습니다.');
+            setUndoConfirm(data);
+        } catch (err) {
+            alert(`되돌리기 확인 실패: ${err.message}`);
+        }
+    };
+
+    const confirmUndo = async () => {
+        setUndoBusy(true);
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/git/undo`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ push: true }),
+            });
+            const data = await res.json();
+            setUndoResult(data);
+            if (data.status === 'success') {
+                setUndoConfirm(null);
+                refreshFileTree(); // 되돌리기로 파일이 삭제/복원됐을 수 있으니 사이드바 갱신
+                loadGitStatus();
+            }
+        } catch (err) {
+            setUndoResult({ status: 'error', steps: [{ cmd: '(연결)', stderr: err.message }] });
+        } finally {
+            setUndoBusy(false);
+        }
+    };
+
+    const cancelUndo = () => setUndoConfirm(null);
 
     const visibleFiles = fileFilter.trim()
         ? fileTree.filter(f => f.toLowerCase().includes(fileFilter.trim().toLowerCase()))
@@ -283,7 +425,7 @@ function CodeAnalysisChat() {
 
     return (
         <>
-            <button className="collect-btn code-analysis-btn" onClick={() => setOpen(true)}>
+            <button type="button" className="collect-btn code-analysis-btn" onClick={() => setOpen(true)}>
                 💻 코딩분석
             </button>
 
@@ -299,11 +441,11 @@ function CodeAnalysisChat() {
                                     onClick={toggleWatcher}
                                     disabled={watcherBusy}
                                     title="VS Code에서 저장할 때마다 자동으로 리뷰합니다"
-                                >
+                                 type="button">
                                     {watching ? '🔴 실시간 감시 중 (끄기)' : '⚪ 실시간 감시 켜기'}
                                 </button>
-                                <button onClick={startNewSession}>🆕 새 대화</button>
-                                <button onClick={() => setOpen(false)}>✕ 닫기</button>
+                                <button onClick={startNewSession} type="button">🆕 새 대화</button>
+                                <button type="button" onClick={() => setOpen(false)}>✕ 닫기</button>
                             </div>
                         </div>
                         <div className="code-analysis-status-row">
@@ -315,6 +457,20 @@ function CodeAnalysisChat() {
                                 <div className="code-analysis-sidebar-title">
                                     📁 참고할 파일 ({includedFiles.length}개 선택됨)
                                 </div>
+                                {vectorAvailable && (
+                                    <div className="code-vector-index-row">
+                                        <button type="button" onClick={refreshVectorIndex} disabled={vectorIndexBusy}>
+                                            {vectorIndexBusy ? '인덱싱 중...' : '🧠 의미검색 인덱스 새로고침'}
+                                        </button>
+                                        {vectorIndexResult && (
+                                            <span className="code-vector-index-result">
+                                                {vectorIndexResult.error
+                                                    ? `⚠️ ${vectorIndexResult.error}`
+                                                    : `✅ ${vectorIndexResult.indexed}개 갱신 · ${vectorIndexResult.skipped}개 변경없음`}
+                                            </span>
+                                        )}
+                                    </div>
+                                )}
                                 <input
                                     type="text"
                                     className="code-analysis-file-filter"
@@ -358,24 +514,52 @@ function CodeAnalysisChat() {
                                                 {m.source === 'watcher' && <span className="code-msg-watcher-badge">🔍 자동 리뷰</span>}
                                             </div>
                                             <pre>{m.content || (streaming && i === messages.length - 1 ? '생각 중...' : '')}</pre>
-                                            {m.proposed_path && (
+                                            {m.proposed_edits && m.proposed_edits.length > 0 && (
                                                 <div className="code-proposal-box">
                                                     <div className="code-proposal-header">
-                                                        📝 수정 제안: {m.proposed_path}
+                                                        📝 수정 제안 ({m.proposed_edits.length}개 파일/블록)
                                                     </div>
-                                                    <details>
-                                                        <summary>제안된 전체 내용 보기</summary>
-                                                        <pre className="code-proposal-content">{m.proposed_content}</pre>
-                                                    </details>
-                                                    {m.applied ? (
-                                                        <span className="code-proposal-applied">✅ 적용됨</span>
-                                                    ) : (
+                                                    {m.proposed_edits.map((edit, ei) => {
+                                                        const result = m.apply_results?.find(r => r.path === edit.path && r.search === edit.search);
+                                                        return (
+                                                            <div key={ei} className="code-edit-block">
+                                                                <div className="code-edit-path">{edit.path}</div>
+                                                                <details>
+                                                                    <summary>변경 내용 보기</summary>
+                                                                    <div className="code-edit-diff">
+                                                                        <pre className="code-edit-search">- {edit.search}</pre>
+                                                                        <pre className="code-edit-replace">+ {edit.replace}</pre>
+                                                                    </div>
+                                                                </details>
+                                                                {result && (
+                                                                    <div className={result.status === 'applied' ? 'code-edit-result ok' : 'code-edit-result error'}>
+                                                                        {result.status === 'applied' ? '✅ 적용됨' : `⚠️ ${result.detail}`}
+                                                                    </div>
+                                                                )}
+                                                                {result?.lint?.available && !result.lint.ok && (
+                                                                    <details className="code-lint-box">
+                                                                        <summary>
+                                                                            🔎 {result.lint.tool} 검사에서 {result.lint.issues?.length || 0}개 이슈 발견
+                                                                        </summary>
+                                                                        <pre className="code-lint-issues">
+                                                                            {(result.lint.issues || []).join('\n')}
+                                                                        </pre>
+                                                                    </details>
+                                                                )}
+                                                                {result?.lint?.available && result.lint.ok && (
+                                                                    <div className="code-lint-ok">✅ {result.lint.tool} 통과</div>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                    {!m.applied && (
                                                         <button
+                                                            type="button"
                                                             className="code-proposal-apply-btn"
                                                             onClick={() => applyProposal(m.id)}
                                                             disabled={applyingId === m.id}
                                                         >
-                                                            {applyingId === m.id ? '적용 중...' : '이 제안 적용하기'}
+                                                            {applyingId === m.id ? '적용 중...' : '이 제안 전체 적용하기'}
                                                         </button>
                                                     )}
                                                 </div>
@@ -383,6 +567,35 @@ function CodeAnalysisChat() {
                                         </div>
                                     ))}
                                     <div ref={bottomRef} />
+                                </div>
+                                <div className="code-architect-toggle-row">
+                                    <label className="code-architect-toggle">
+                                        <input
+                                            type="checkbox"
+                                            checked={fastMode}
+                                            onChange={(e) => { setFastMode(e.target.checked); if (e.target.checked) setArchitectMode(false); }}
+                                            disabled={streaming}
+                                        />
+                                        ⚡ 빠른 모드 (qwen2.5-coder:14b · Architect와는 같이 못 씀, 에이전트와는 같이 사용 가능)
+                                    </label>
+                                    <label className="code-architect-toggle">
+                                        <input
+                                            type="checkbox"
+                                            checked={architectMode}
+                                            onChange={(e) => { setArchitectMode(e.target.checked); if (e.target.checked) { setAgentMode(false); setFastMode(false); } }}
+                                            disabled={streaming}
+                                        />
+                                        🏗️ Architect 모드 (설계 → 패치 작성 2단계, 복잡한 수정에 권장 · 느림)
+                                    </label>
+                                    <label className="code-architect-toggle">
+                                        <input
+                                            type="checkbox"
+                                            checked={agentMode}
+                                            onChange={(e) => { setAgentMode(e.target.checked); if (e.target.checked) setArchitectMode(false); }}
+                                            disabled={streaming}
+                                        />
+                                        🤖 에이전트 모드 (파일을 스스로 조사, 왼쪽 체크박스 무시됨 · 가장 느림 · 위 빠른모드와 같이 켜면 14b로 조사)
+                                    </label>
                                 </div>
                                 <div className="code-analysis-input">
                                     <textarea
@@ -401,10 +614,44 @@ function CodeAnalysisChat() {
                                         className="collect-btn code-analysis-send-btn"
                                         onClick={sendMessage}
                                         disabled={streaming || !input.trim()}
-                                    >
+                                     type="button">
                                         {streaming ? '생성 중...' : '전송'}
                                     </button>
                                 </div>
+
+                                {gitStatus && gitStatus.length > 0 && (
+                                    <div className="code-git-status-box">
+                                        <div className="code-git-status-header">
+                                            📋 커밋될 파일 ({checkedGitPaths.size}/{gitStatus.length}개 선택됨)
+                                            <span>
+                                                <button
+                                                    type="button"
+                                                    className="code-git-status-refresh"
+                                                    onClick={() => setCheckedGitPaths(new Set(gitStatus.map(f => f.path)))}
+                                                >
+                                                    전체선택
+                                                </button>
+                                                <button type="button" className="code-git-status-refresh" onClick={loadGitStatus} title="새로고침">🔄</button>
+                                            </span>
+                                        </div>
+                                        <div className="code-git-status-list">
+                                            {gitStatus.map(f => (
+                                                <label key={f.path} className="code-git-status-item">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={checkedGitPaths.has(f.path)}
+                                                        onChange={() => toggleGitFile(f.path)}
+                                                    />
+                                                    <span className="code-git-status-code">{f.status}</span>
+                                                    <span className="code-git-status-path">{f.path}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                {gitStatus && gitStatus.length === 0 && (
+                                    <div className="code-git-status-clean">✅ 변경된 파일 없음 (커밋할 게 없습니다)</div>
+                                )}
 
                                 <div className="code-commit-row">
                                     <input
@@ -419,13 +666,56 @@ function CodeAnalysisChat() {
                                         className="code-commit-btn"
                                         onClick={commitAndPush}
                                         disabled={commitBusy || !commitMessage.trim()}
-                                    >
+                                     type="button">
                                         {commitBusy ? '커밋 중...' : '📤 커밋 & 푸시'}
                                     </button>
+                                    <button
+                                        className="code-undo-btn"
+                                        onClick={requestUndoConfirm}
+                                        disabled={undoBusy || !!undoConfirm}
+                                        title="마지막 커밋을 revert로 되돌립니다 (히스토리를 지우지 않고 반대 커밋을 추가)"
+                                     type="button">
+                                        ↩️ 되돌리기
+                                    </button>
                                 </div>
+
+                                {undoConfirm && (
+                                    <div className="code-undo-confirm">
+                                        마지막 커밋을 되돌릴까요?{' '}
+                                        <span className="github-commit-sha">{undoConfirm.sha}</span> {undoConfirm.message}
+                                        <div className="code-undo-confirm-actions">
+                                            <button onClick={confirmUndo} disabled={undoBusy} className="code-undo-confirm-yes" type="button">
+                                                {undoBusy ? '되돌리는 중...' : '되돌리기 (revert + push)'}
+                                            </button>
+                                            <button onClick={cancelUndo} disabled={undoBusy} className="code-undo-confirm-no" type="button">취소</button>
+                                        </div>
+                                    </div>
+                                )}
+                                {undoResult && (
+                                    <div className={undoResult.status === 'success' ? 'code-commit-result ok' : 'code-commit-result error'}>
+                                        {undoResult.status === 'success' ? '✅ 되돌리기 완료 (푸시됨)' : '⚠️ 되돌리기 실패'}
+                                        <details>
+                                            <summary>상세 로그</summary>
+                                            <pre>{(undoResult.steps || []).map(s => `$ git ${s.cmd}\n${s.stdout || ''}${s.stderr || ''}`).join('\n\n')}</pre>
+                                        </details>
+                                    </div>
+                                )}
+
                                 {commitResult && (
                                     <div className={commitResult.status === 'success' ? 'code-commit-result ok' : 'code-commit-result error'}>
                                         {commitResult.status === 'success' ? '✅ 커밋/푸시 완료' : '⚠️ 실패'}
+                                        {commitResult.githubCheck && (
+                                            <div className="github-verify-row">
+                                                🐙 GitHub 확인됨: <span className="github-commit-sha">{commitResult.githubCheck.sha}</span>{' '}
+                                                {commitResult.githubCheck.message}{' '}
+                                                <a href={commitResult.githubCheck.html_url} target="_blank" rel="noreferrer">보기</a>
+                                            </div>
+                                        )}
+                                        {commitResult.status === 'success' && !commitResult.githubCheck && (
+                                            <div className="github-verify-row github-verify-pending">
+                                                🐙 GitHub 반영 확인 중...
+                                            </div>
+                                        )}
                                         <details>
                                             <summary>상세 로그</summary>
                                             <pre>{(commitResult.steps || []).map(s => `$ git ${s.cmd}\n${s.stdout || ''}${s.stderr || ''}`).join('\n\n')}</pre>

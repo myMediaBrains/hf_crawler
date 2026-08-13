@@ -2498,7 +2498,7 @@ body {
 /* ---------------------------------------------------------------------
    code-analysis-*.css
    2026-08-13: "💻 코딩분석" 버튼 + 웹 클로드 방식 채팅 모달.
-   기존 genre-editor-*/github-repos-* 패턴(오버레이+패널, 다크테마 CSS 변수)을
+   기존 genre-editor-*, github-repos-* 패턴(오버레이+패널, 다크테마 CSS 변수)을
    그대로 재사용한다. 기존 App.css 맨 끝에 그대로 붙여넣으세요.
 --------------------------------------------------------------------- */
 
@@ -2631,6 +2631,35 @@ body {
   flex-shrink: 0;
 }
 
+.code-vector-index-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+.code-vector-index-row button {
+  padding: 4px 10px;
+  border: 1px solid rgba(167, 139, 250, 0.4);
+  border-radius: var(--radius-sm);
+  background: rgba(167, 139, 250, 0.08);
+  color: #a78bfa;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.code-vector-index-row button:hover:not(:disabled) {
+  background: rgba(167, 139, 250, 0.15);
+}
+.code-vector-index-row button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.code-vector-index-result {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
 .code-analysis-file-filter {
   width: 100%;
   padding: 6px 10px;
@@ -2753,6 +2782,22 @@ body {
   border: 1px solid var(--border-color);
 }
 
+.code-architect-toggle-row {
+  flex-shrink: 0;
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+.code-architect-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 .code-analysis-input {
   display: flex;
   gap: 8px;
@@ -2845,6 +2890,89 @@ body {
   font-size: 12px;
 }
 
+.code-edit-block {
+  margin: 8px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed rgba(139, 92, 246, 0.25);
+}
+.code-edit-block:last-of-type {
+  border-bottom: none;
+}
+
+.code-edit-path {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.code-edit-block summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.code-edit-diff {
+  margin-top: 4px;
+}
+.code-edit-diff pre {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: var(--radius-sm);
+}
+.code-proposal-box .code-edit-search {
+  background: rgba(239, 68, 68, 0.08);
+  color: #f87171;
+  border-left: 3px solid #ef4444;
+}
+.code-proposal-box .code-edit-replace {
+  background: rgba(52, 211, 153, 0.08);
+  color: #34d399;
+  border-left: 3px solid #34d399;
+  margin-top: 2px !important;
+}
+
+.code-edit-result {
+  margin-top: 4px;
+  font-size: 11.5px;
+}
+.code-edit-result.ok {
+  color: #34d399;
+}
+.code-edit-result.error {
+  color: #f87171;
+}
+
+.code-lint-box {
+  margin-top: 4px;
+  font-size: 11.5px;
+}
+.code-lint-box summary {
+  cursor: pointer;
+  color: #fbbf24;
+}
+.code-lint-issues {
+  margin-top: 4px;
+  padding: 8px 10px;
+  background: rgba(251, 191, 36, 0.06);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  color: #fbbf24;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.code-lint-ok {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: #34d399;
+}
+
 .code-proposal-apply-btn {
   margin-top: 6px;
   padding: 5px 12px;
@@ -2870,6 +2998,65 @@ body {
   color: #34d399;
   font-size: 12.5px;
   font-weight: 600;
+}
+
+.code-git-status-box {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.02);
+  flex-shrink: 0;
+}
+.code-git-status-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.code-git-status-refresh {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 0 4px;
+}
+.code-git-status-list {
+  max-height: 140px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.code-git-status-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 2px 0;
+  cursor: pointer;
+  color: var(--text-primary);
+}
+.code-git-status-code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #fbbf24;
+  width: 20px;
+  flex-shrink: 0;
+}
+.code-git-status-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.code-git-status-clean {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #34d399;
+  flex-shrink: 0;
 }
 
 .code-commit-row {
@@ -2910,6 +3097,67 @@ body {
 .code-commit-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.code-undo-btn {
+  padding: 8px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.code-undo-btn:hover:not(:disabled) {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+.code-undo-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.code-undo-confirm {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  border-radius: var(--radius-md);
+  background: rgba(251, 191, 36, 0.06);
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.code-undo-confirm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.code-undo-confirm-yes {
+  padding: 5px 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: #ef4444;
+  color: white;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.code-undo-confirm-yes:hover:not(:disabled) {
+  background: #dc2626;
+}
+.code-undo-confirm-yes:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.code-undo-confirm-no {
+  padding: 5px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  cursor: pointer;
 }
 
 .code-commit-result {
@@ -3039,5 +3287,296 @@ body {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ---------------------------------------------------------------------
+   hf_coder GitHub 브라우징 (신규, 2026-08-13)
+   GitHubBrowser.jsx 전용 스타일 + CodeAnalysisChat.jsx의 커밋 확인 표시.
+   code-analysis-overlay/panel/sidebar 등 기존 클래스를 재사용한다.
+--------------------------------------------------------------------- */
+
+.github-browser-btn {
+  background-color: #6e5494 !important;
+}
+.github-browser-btn:hover:not(:disabled) {
+  background-color: #5a4477 !important;
+}
+
+.github-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+
+.github-tab {
+  padding: 6px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.github-tab.active {
+  background: #6e5494;
+  border-color: #6e5494;
+  color: white;
+  font-weight: 600;
+}
+
+.github-other-input-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.github-other-input-row input {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  width: 160px;
+}
+.github-other-input-row button {
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: #6e5494;
+  color: white;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.github-error {
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-md);
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+
+.github-repo-summary-row {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.github-stars {
+  color: #fbbf24;
+}
+.github-branch-badge {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(110, 84, 148, 0.15);
+  color: #a78bfa;
+  font-size: 11px;
+}
+
+.github-rate-limit {
+  font-size: 11px;
+  color: var(--text-secondary);
+  align-self: center;
+}
+
+.github-file-selected {
+  background: rgba(110, 84, 148, 0.15) !important;
+}
+
+.github-file-path {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+.github-file-content {
+  flex: 1;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12.5px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 12px;
+}
+
+.github-commits-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.github-commits-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.github-commit-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.github-commit-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.github-commit-sha {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: #a78bfa;
+  flex-shrink: 0;
+}
+.github-commit-msg {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.github-commit-meta {
+  color: var(--text-secondary);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.github-verify-row {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #34d399;
+}
+.github-verify-row a {
+  color: #a78bfa;
+}
+.github-verify-pending {
+  color: var(--text-secondary);
+}
+
+/* ---------------------------------------------------------------------
+   Docker 샌드박스 (신규, 2026-08-13)
+   GitHubBrowser.jsx의 "타 저장소 탐색" 탭에서만 노출.
+--------------------------------------------------------------------- */
+
+.sandbox-panel {
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+
+.sandbox-clone-btn {
+  padding: 8px 14px;
+  border: 1px dashed rgba(56, 189, 248, 0.5);
+  border-radius: var(--radius-md);
+  background: rgba(56, 189, 248, 0.06);
+  color: #38bdf8;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.sandbox-clone-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.12);
+}
+.sandbox-clone-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.sandbox-run-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sandbox-image-badge {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.1);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  white-space: nowrap;
+}
+
+.sandbox-command-input {
+  flex: 1;
+  min-width: 180px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12.5px;
+}
+.sandbox-command-input:focus {
+  outline: none;
+  border-color: #38bdf8;
+}
+
+.sandbox-run-row button {
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sandbox-run-row button:hover:not(:disabled) {
+  border-color: var(--border-hover);
+}
+.sandbox-run-row button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sandbox-result {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-color);
+  font-size: 12px;
+}
+.sandbox-result.error {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.06);
+  color: #f87171;
+}
+.sandbox-result-meta {
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.sandbox-output {
+  max-height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-input);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 11.5px;
+  margin-bottom: 4px;
+}
+.sandbox-stderr {
+  color: #f87171;
+}
+
+.sandbox-unavailable {
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
 }
 
