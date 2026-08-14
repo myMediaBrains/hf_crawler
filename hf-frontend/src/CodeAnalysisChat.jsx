@@ -28,6 +28,18 @@ function CodeAnalysisChat() {
     const [architectMode, setArchitectMode] = useState(false);
     const [agentMode, setAgentMode] = useState(false);
     const [fastMode, setFastMode] = useState(false);
+    // 2026-08-14(개정): 예전엔 agentModel이 '30b'/'14b'/'glimmer' 3개 고정값이었는데,
+    // 이제 백엔드(GET /codeanalysis/models)가 맥북에 실제로 설치된 ollama 모델을
+    // 전부 알려주므로 그 목록을 그대로 라디오로 그린다. agentModel은 이제 ollama list의
+    // 실제 모델명 문자열('' = 미선택 = 백엔드 기본값 사용)을 그대로 담는다.
+    const [agentModel, setAgentModel] = useState(''); // '' = 자동(백엔드 기본값), 그 외엔 ollama 모델명 그대로
+    const [availableModels, setAvailableModels] = useState([]); // GET /codeanalysis/models 결과
+    const [modelsLoading, setModelsLoading] = useState(false);
+    // 2026-08-14(신규): 켜면 스트리밍 출력을 로컬 Typora 파일로도 미러링한다
+    // (typora_sync.py). typoraPath는 "🖥 Typora에서 열기" 버튼/안내 문구용.
+    const [syncToTypora, setSyncToTypora] = useState(false);
+    const [typoraPath, setTyporaPath] = useState('');
+    const [typoraBusy, setTyporaBusy] = useState(false);
     const [watcherBusy, setWatcherBusy] = useState(false);
     const [applyingId, setApplyingId] = useState(null);
     const [commitMessage, setCommitMessage] = useState('');
@@ -52,6 +64,41 @@ function CodeAnalysisChat() {
     // 호출한다. git 작업으로 파일이 삭제/생성될 수 있는데, 그때마다 사이드바가
     // 저절로 갱신 안 되면 실제로는 지워진 파일이 체크된 채로 화면에 남아있는
     // 것처럼 보이는 문제가 있었다 - 사라진 파일은 선택 목록에서도 같이 뺀다.
+    // 2026-08-14(신규): ollama list에 실제로 설치된 모델 전체를 불러온다 - 에이전트
+    // 모드 라디오를 이 결과로 그린다. 실패해도 조용히 빈 배열로 - 에이전트 모드
+    // 자체는 여전히 동작해야 하고(백엔드 기본값으로), 목록만 못 보여주면 된다.
+    const refreshAvailableModels = () => {
+        setModelsLoading(true);
+        fetch(`${API_URL}/codeanalysis/models`)
+            .then(r => r.json())
+            .then(data => setAvailableModels(data.models || []))
+            .catch(() => setAvailableModels([]))
+            .finally(() => setModelsLoading(false));
+    };
+
+    // 2026-08-14(신규): Typora 미러링 파일 경로 조회 - 안내 문구에 표시.
+    const refreshTyporaStatus = () => {
+        fetch(`${API_URL}/codeanalysis/typora/status`)
+            .then(r => r.json())
+            .then(data => setTyporaPath(data.path || ''))
+            .catch(() => {});
+    };
+
+    const openInTypora = async () => {
+        if (typoraBusy) return;
+        setTyporaBusy(true);
+        try {
+            const res = await fetch(`${API_URL}/codeanalysis/typora/open`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Typora를 열지 못했습니다.');
+            setTyporaPath(data.path || typoraPath);
+        } catch (err) {
+            alert(`Typora 열기 실패: ${err.message}`);
+        } finally {
+            setTyporaBusy(false);
+        }
+    };
+
     const refreshFileTree = () => {
         setLoadingTree(true);
         fetch(`${API_URL}/codeanalysis/files`)
@@ -79,6 +126,8 @@ function CodeAnalysisChat() {
         setSessionId(sid);
 
         refreshFileTree();
+        refreshAvailableModels();
+        refreshTyporaStatus();
 
         fetch(`${API_URL}/codeanalysis/history/${sid}`)
             .then(r => r.json())
@@ -156,8 +205,16 @@ function CodeAnalysisChat() {
 
         try {
             const endpoint = agentMode ? '/codeanalysis/agent/stream' : '/codeanalysis/chat/stream';
+            // 2026-08-14(개정): 에이전트 모드는 이제 agentModel에 ollama list의 실제
+            // 모델명 문자열이 그대로 담겨있으므로, 그걸 model 필드로 넘긴다.
+            // agentModel이 ''(미선택)이면 model 자체를 아예 안 보내서 백엔드
+            // 기본값(agent_loop, 30b)을 쓰게 한다.
             const body = agentMode
-                ? { session_id: sessionId, message: userText, user_id: userId, fast_mode: fastMode }
+                ? {
+                    session_id: sessionId, message: userText, user_id: userId,
+                    ...(agentModel ? { model: agentModel } : {}),
+                    sync_to_typora: syncToTypora,
+                }
                 : {
                     session_id: sessionId,
                     message: userText,
@@ -165,6 +222,7 @@ function CodeAnalysisChat() {
                     user_id: userId,
                     architect: architectMode,
                     fast_mode: fastMode,
+                    sync_to_typora: syncToTypora,
                 };
 
             const res = await fetch(`${API_URL}${endpoint}`, {
@@ -569,15 +627,17 @@ function CodeAnalysisChat() {
                                     <div ref={bottomRef} />
                                 </div>
                                 <div className="code-architect-toggle-row">
-                                    <label className="code-architect-toggle">
-                                        <input
-                                            type="checkbox"
-                                            checked={fastMode}
-                                            onChange={(e) => { setFastMode(e.target.checked); if (e.target.checked) setArchitectMode(false); }}
-                                            disabled={streaming}
-                                        />
-                                        ⚡ 빠른 모드 (qwen2.5-coder:14b · Architect와는 같이 못 씀, 에이전트와는 같이 사용 가능)
-                                    </label>
+                                    {!agentMode && (
+                                        <label className="code-architect-toggle">
+                                            <input
+                                                type="checkbox"
+                                                checked={fastMode}
+                                                onChange={(e) => { setFastMode(e.target.checked); if (e.target.checked) setArchitectMode(false); }}
+                                                disabled={streaming}
+                                            />
+                                            ⚡ 빠른 모드 (qwen2.5-coder:14b · Architect와는 같이 못 씀)
+                                        </label>
+                                    )}
                                     <label className="code-architect-toggle">
                                         <input
                                             type="checkbox"
@@ -594,8 +654,88 @@ function CodeAnalysisChat() {
                                             onChange={(e) => { setAgentMode(e.target.checked); if (e.target.checked) setArchitectMode(false); }}
                                             disabled={streaming}
                                         />
-                                        🤖 에이전트 모드 (파일을 스스로 조사, 왼쪽 체크박스 무시됨 · 가장 느림 · 위 빠른모드와 같이 켜면 14b로 조사)
+                                        🤖 에이전트 모드 (파일을 스스로 조사, 왼쪽 체크박스 무시됨 · 가장 느림)
                                     </label>
+                                    <label className="code-architect-toggle" title={typoraPath ? `미러링 파일: ${typoraPath}` : undefined}>
+                                        <input
+                                            type="checkbox"
+                                            checked={syncToTypora}
+                                            onChange={(e) => setSyncToTypora(e.target.checked)}
+                                        />
+                                        📝 Typora로 보기 (실시간 출력을 로컬 마크다운 파일로 미러링)
+                                    </label>
+                                    {syncToTypora && (
+                                        <button
+                                            type="button"
+                                            className="code-typora-open-btn"
+                                            onClick={openInTypora}
+                                            disabled={typoraBusy}
+                                            title={typoraPath || 'Typora에서 열기'}
+                                        >
+                                            {typoraBusy ? '여는 중...' : '🖥 Typora에서 열기'}
+                                        </button>
+                                    )}
+                                    {agentMode && (
+                                        <div className="code-agent-model-select" role="radiogroup" aria-label="에이전트 모드 LLM 선택">
+                                            <span className="code-agent-model-select-label">
+                                                에이전트 모델:
+                                                <button
+                                                    type="button"
+                                                    className="code-agent-model-refresh"
+                                                    onClick={refreshAvailableModels}
+                                                    disabled={modelsLoading}
+                                                    title="ollama list 다시 불러오기"
+                                                >
+                                                    🔄
+                                                </button>
+                                            </span>
+                                            <label className="code-agent-model-option">
+                                                <input
+                                                    type="radio"
+                                                    name="agentModel"
+                                                    value=""
+                                                    checked={agentModel === ''}
+                                                    onChange={() => setAgentModel('')}
+                                                    disabled={streaming}
+                                                />
+                                                자동 (기본값)
+                                            </label>
+                                            {modelsLoading && availableModels.length === 0 && (
+                                                <span className="code-agent-model-loading">모델 목록 불러오는 중...</span>
+                                            )}
+                                            {!modelsLoading && availableModels.length === 0 && (
+                                                <span className="code-agent-model-empty">
+                                                    설치된 모델을 찾지 못했습니다 (ollama가 켜져있는지 확인해주세요)
+                                                </span>
+                                            )}
+                                            {availableModels.map(m => (
+                                                <label
+                                                    className={
+                                                        m.supports_tools === false
+                                                            ? 'code-agent-model-option code-agent-model-option-warn'
+                                                            : 'code-agent-model-option'
+                                                    }
+                                                    key={m.name}
+                                                    title={
+                                                        m.supports_tools === false
+                                                            ? '이 모델은 도구 호출(tool calling)을 지원하지 않는 것으로 확인됨 - 에이전트 모드에서 빈 응답이 나올 수 있습니다.'
+                                                            : undefined
+                                                    }
+                                                >
+                                                    <input
+                                                        type="radio"
+                                                        name="agentModel"
+                                                        value={m.name}
+                                                        checked={agentModel === m.name}
+                                                        onChange={() => setAgentModel(m.name)}
+                                                        disabled={streaming}
+                                                    />
+                                                    {m.name}{typeof m.size_gb === 'number' ? ` (${m.size_gb}GB)` : ''}
+                                                    {m.supports_tools === false && ' ⚠️ 도구 호출 미지원'}
+                                                </label>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="code-analysis-input">
                                     <textarea
